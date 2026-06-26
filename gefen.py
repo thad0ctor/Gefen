@@ -811,6 +811,16 @@ class Gefen(torch.optim.Optimizer):
 
         flat_grad = grad.reshape(-1)
 
+        # Empty local shard (e.g. a tiny or uneven DTensor/FSDP2 rank that owns
+        # zero elements): there is nothing to update and no period to predict.
+        # _iter_gefen_grad_periods already skips these during codebook learning,
+        # so state["automatic_period"] is never set for them; mirror that here
+        # and no-op instead of raising in the state-init branch below. The guard
+        # precedes every state access, so empty shards also no-op on later steps
+        # rather than KeyError-ing on the missing vmean.
+        if flat_grad.numel() == 0:
+            return
+
         if "step" not in state:
             # grad (hence flat_grad) is already unwrapped to the local shard, and
             # _predict_period_from_grad_sq derives the period from that local
