@@ -98,6 +98,17 @@ def automatic_vmean_update(
 GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
 
 
+# Dequantize the stored uint8 indices into codebook coefficients in element
+# chunks of this size. The naive `codebook[stored.long()]` makes a full-size
+# int64 copy of the indices (8N bytes) on top of the full-size fp32 gather
+# (4N bytes), so the transient peaks at ~12N before the final cast even though
+# only the 2N/4N output is kept -- and this runs every step on both the fused and
+# non-fused paths. Chunked index_select keeps the int64 index temporary and the
+# fp32 gather bounded to one chunk while writing straight into the preallocated
+# output. Same constant as the search chunk for the same launch-overhead reason.
+GEFEN_DEQUANT_GATHER_CHUNK = 1 << 23
+
+
 def gefen_nearest_codebook_indices(
     codebook: torch.Tensor, normalized_vals: torch.Tensor
 ) -> torch.Tensor:
@@ -161,9 +172,23 @@ def gefen_dequantize_unpacked_indices(
             )
         )
 
-    coeff = codebook[stored_indices.long()].to(
-        device=like_tensor.device, dtype=like_tensor.dtype
+    # Equivalent to `codebook[stored_indices.long()].to(device, dtype)` but
+    # without the full-size int64 index copy + full-size fp32 gather: chunked
+    # index_select gathers one bounded slice at a time and copy_ writes it into
+    # the preallocated output, casting fp32 -> output dtype (and crossing devices
+    # if needed) per chunk. The gathered values and the fp32->dtype rounding are
+    # identical to advanced indexing, so the result is bit-for-bit the same.
+    coeff = torch.empty(
+        stored_indices.shape, dtype=like_tensor.dtype, device=like_tensor.device
     )
+    coeff_flat = coeff.view(-1)
+    idx_flat = stored_indices.reshape(-1)
+    n = idx_flat.numel()
+    chunk = GEFEN_DEQUANT_GATHER_CHUNK
+    for start in range(0, n, chunk):
+        stop = start + chunk
+        seg = idx_flat[start:stop].long()
+        coeff_flat[start:stop].copy_(codebook.index_select(0, seg))
     if hasattr(like_tensor, "device_mesh") and hasattr(like_tensor, "placements"):
         coeff_cls = type(like_tensor)
         if hasattr(coeff_cls, "from_local"):
