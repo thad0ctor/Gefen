@@ -1,4 +1,5 @@
 import math
+from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -70,7 +71,10 @@ def automatic_vmean_update(
         automatic_vmean_update_cuda(vmean, grad_view, beta2)
         return
 
-    block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
+    # Accumulate in float32 to match the fused kernel and the float32 vmean
+    # buffer; grad_view is the model dtype (e.g. bf16) under non-fused training.
+    grad_view_f32 = grad_view.float()
+    block_mean_grad_sq = torch.mean(grad_view_f32 * grad_view_f32, dim=1, keepdim=True)
     vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
 
 
@@ -652,9 +656,35 @@ class Gefen(torch.optim.Optimizer):
         if codebook is not None:
             self._gefen_codebook = codebook
 
+    def _resuming_from_checkpoint(self) -> bool:
+        # On resume every param's state has a restored automatic_period; on a
+        # fresh run the state is still empty when the first step starts.
+        return any(
+            "automatic_period" in self.state.get(p, {})
+            for group in self.param_groups
+            for p in group["params"]
+        )
+
     def _maybe_refresh_gefen_codebook(self) -> None:
-        if self._gefen_codebook is None:
-            self._ensure_gefen_codebook()
+        if self._gefen_codebook is not None:
+            # A codebook restored from a checkpoint may land on CPU (depending on
+            # the load map_location); move it onto the gradient device once.
+            device = self._gefen_codebook_device()
+            if self._gefen_codebook.device != device:
+                self._gefen_codebook = self._gefen_codebook.to(device)
+            return
+
+        # No codebook yet. On a fresh run this learns it and predicts periods.
+        # On resume the persisted codebook is normally restored in
+        # load_state_dict, but FSDP optim-state consolidation strips custom
+        # top-level keys, so the codebook can be missing even though the
+        # per-param state (incl. automatic_period) was restored. In that case we
+        # must reuse the restored periods rather than re-predict them, otherwise
+        # the refreshed periods desync from the restored vmean/m_codebook block
+        # geometry and the vmean kernel aborts on a block-count mismatch.
+        self._ensure_gefen_codebook(
+            reuse_existing_periods=self._resuming_from_checkpoint()
+        )
 
     def _maybe_save_gefen_grad_histogram(self) -> None:
         if not hasattr(quantization_module, "LIST_STEPS_SAVE_HIST_GRAD"):
@@ -761,7 +791,10 @@ class Gefen(torch.optim.Optimizer):
             self._gefen_dequantize_m_coefficients(state, grad_view)
             * state["m_magnitude"]
         )
-        updated_m = current_m.lerp(grad_view, 1 - beta1)
+        # current_m is float32 (m_magnitude is float32); grad_view is the model
+        # dtype. lerp() requires both operands to share a dtype, so promote the
+        # gradient. This is the non-fused / FSDP2-meta-tensor path.
+        updated_m = current_m.lerp(grad_view.to(current_m.dtype), 1 - beta1)
 
         state["m_magnitude"].copy_(
             self._automatic_reduce(updated_m.abs().reshape(-1), period, reduce_op="max")
@@ -890,12 +923,76 @@ class Gefen(torch.optim.Optimizer):
     def state_dict(self):
         state_dict = super().state_dict()
         state_dict["gefen_global_step"] = self._gefen_global_step
+        # The exact-DP codebook is learned once on the first step and then frozen
+        # for the rest of the run. It is not per-param state, so persist it
+        # explicitly; without it resume re-learns the codebook (see
+        # _maybe_refresh_gefen_codebook) which re-predicts and overwrites every
+        # restored automatic_period, desyncing them from the saved
+        # vmean/m_codebook. (Note: under FSDP optim-state consolidation strips
+        # these custom top-level keys; _maybe_refresh_gefen_codebook handles that
+        # fallback by reusing the restored periods.)
+        state_dict["gefen_codebook"] = self._gefen_codebook
         return state_dict
 
     def load_state_dict(self, state_dict):
+        # Shallow-copy so the pop()s below don't mutate the caller's checkpoint
+        # dict (torch.optim.Optimizer.load_state_dict leaves its input intact);
+        # otherwise a second load of the same dict loses the gefen_* keys.
+        state_dict = dict(state_dict)
         gefen_global_step = state_dict.pop("gefen_global_step", 0)
+        gefen_codebook = state_dict.pop("gefen_codebook", None)
+
+        # torch.optim.Optimizer.load_state_dict casts *every* per-param state
+        # tensor to the owning parameter's dtype whenever that parameter is
+        # floating point. For a bf16 model that silently downcasts Gefen's
+        # float32 aux moments (vmean, m_magnitude) and its uint8 quantized
+        # momentum codebook (m_codebook) to bf16, after which the CUDA kernels
+        # reject the wrong dtypes and the first post-resume step crashes. Stash
+        # the pristine saved tensors and write them back after the base load so
+        # every aux tensor round-trips losslessly (a bf16 round-trip would also
+        # corrupt the float32 moments). Keyed off the saved state, not hard-coded
+        # names, so any future aux tensor is preserved too.
+        saved_state = state_dict.get("state", {}) or {}
+
         super().load_state_dict(state_dict)
         self._gefen_global_step = gefen_global_step
+
+        # Restoring the frozen codebook keeps _maybe_refresh_gefen_codebook a
+        # no-op on the first resume step, so the restored automatic_period values
+        # stay consistent with the restored vmean/m_codebook block geometry.
+        # Assign unconditionally: when FSDP strips the codebook (gefen_codebook is
+        # None) any stale codebook from a prior train/load must be cleared, else
+        # _maybe_refresh_gefen_codebook returns early and skips the restored-period
+        # fallback.
+        self._gefen_codebook = gefen_codebook
+
+        # Map saved param ids -> live param objects exactly as the base class
+        # does, then restore each aux tensor from its pristine saved copy.
+        id_map = dict(
+            zip(
+                chain.from_iterable(
+                    group["params"] for group in state_dict["param_groups"]
+                ),
+                chain.from_iterable(group["params"] for group in self.param_groups),
+            )
+        )
+        for param_id, saved_param_state in saved_state.items():
+            param = id_map.get(param_id)
+            if param is None:
+                continue
+            live_state = self.state.get(param)
+            if live_state is None:
+                continue
+            for key, saved_value in saved_param_state.items():
+                if not torch.is_tensor(saved_value):
+                    continue
+                live_value = live_state.get(key)
+                if torch.is_tensor(live_value) and live_value.dtype == saved_value.dtype:
+                    continue
+                device = (
+                    live_value.device if torch.is_tensor(live_value) else param.device
+                )
+                live_state[key] = saved_value.to(device=device, dtype=saved_value.dtype)
 
     @torch.no_grad()
     def step(self, closure=None):
