@@ -24,7 +24,10 @@ try:
 except ImportError:  # pragma: no cover - allows the script path without pytest
     pytest = None
 
-from gefen.gefen import gefen_dequantize_unpacked_indices
+from gefen.gefen import (
+    GEFEN_DEQUANT_GATHER_CHUNK,
+    gefen_dequantize_unpacked_indices,
+)
 
 
 def _reference_dequantize(codebook, stored_indices, like_tensor):
@@ -72,6 +75,19 @@ def _run():
         for dt in (torch.bfloat16, torch.float32):
             like = torch.empty(rows, cols, device=device, dtype=dt)
             _assert_parity(cb, stored, like)
+
+    # --- ragged: spans >2 chunks and is NOT a multiple of the chunk -------------
+    # The shapes above are all exact multiples of GEFEN_DEQUANT_GATHER_CHUNK, so
+    # the short final-chunk branch (start:stop overshooting n) is otherwise
+    # untested.
+    cb = _sorted_codebook(256, device, seed=2)
+    ragged_n = 2 * GEFEN_DEQUANT_GATHER_CHUNK + 1234567
+    g = torch.Generator(device=device).manual_seed(99)
+    stored = torch.randint(
+        0, cb.numel(), (ragged_n,), device=device, dtype=torch.uint8, generator=g
+    )
+    like = torch.empty(ragged_n, device=device, dtype=torch.bfloat16)
+    _assert_parity(cb, stored, like)
 
     # --- small codebooks k = 1, 2 ----------------------------------------------
     for k in (1, 2):

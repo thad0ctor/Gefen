@@ -69,38 +69,6 @@ def _assert_parity(codebook, vals):
     )
 
 
-def _assert_fp32_near_parity(codebook, vals):
-    """fp32 contract: the midpoint form is NOT provably bit-exact against the old
-    gather/abs/where form, because within ~1 ULP of a midpoint the old form's two
-    independent abs-distance subtractions can round equal where `v <= mid` does
-    not. Such ties are vanishingly rare and immaterial. Assert exactly that: any
-    disagreement is (a) rare, (b) between *adjacent* codewords, and (c) a genuine
-    distance-tie (so the reconstruction error difference is ~0)."""
-    ref = _reference_nearest_codebook_indices(codebook, vals).long()
-    got = gefen_nearest_codebook_indices(codebook, vals).long()
-    assert got.shape == vals.shape
-    disagree = ref != got
-    n = vals.numel()
-    nd = int(disagree.sum())
-    # vanishingly rare: a systematic off-by-one would light up millions, not a
-    # handful. Ceiling well below any real regression, well above the tie rate.
-    assert nd <= max(8, n // 1_000_000), f"too many fp32 disagreements: {nd}/{n}"
-    if nd:
-        sel = disagree.reshape(-1).nonzero().flatten()
-        v = vals.reshape(-1)[sel].float()
-        oi = ref.reshape(-1)[sel]
-        gi = got.reshape(-1)[sel]
-        assert torch.equal((oi - gi).abs(), torch.ones_like(oi)), (
-            "fp32 disagreement between non-adjacent codewords (not a tie)"
-        )
-        do = (v - codebook[oi]).abs()
-        dg = (v - codebook[gi]).abs()
-        rel = (do - dg).abs() / (do + dg).clamp_min(1e-30)
-        assert rel.max().item() < 1e-3, (
-            f"fp32 disagreement is not a distance-tie: max rel gap {rel.max().item()}"
-        )
-
-
 def _run():
     device = torch.device("cuda")
 
@@ -117,31 +85,27 @@ def _run():
     _assert_parity(cb256, vals)
 
     # --- 1b. random uniform fp32 data (plain-Gefen production dtype) ------------
-    # fp32 is near-parity, not bit-exact: a handful of values land within ~1 ULP
-    # of a midpoint and flip by one (adjacent) index. _assert_fp32_near_parity
-    # pins that those are rare, immaterial ties (see its docstring).
+    # The chunked form runs the original gather/abs/where arithmetic per chunk, so
+    # it is bit-exact for fp32 too (the plain-Gefen momentum path), not merely for
+    # bf16 -- the quantized indices feed the next step, so this keeps the optimizer
+    # trajectory unchanged.
     g = torch.Generator(device=device).manual_seed(2)
     vals_fp32 = torch.empty(4096, 4096, device=device, dtype=torch.float32).uniform_(
         -1.2, 1.2, generator=g
     )
-    _assert_fp32_near_parity(cb256, vals_fp32)
+    _assert_parity(cb256, vals_fp32)
 
     # --- 2. values exactly at codebook points ----------------------------------
     _assert_parity(cb256, cb256.bfloat16())
     _assert_parity(cb256, cb256.float())
 
     # --- 3. values exactly at midpoints (the tie-break boundary) ---------------
-    # Midpoints are fed as bf16 here. Feeding *exact fp32* midpoints is
-    # deliberately NOT asserted: mid = (cb[i]+cb[i+1])*0.5 rounded in fp32 is not
-    # bit-exactly equidistant from its two neighbours, so the reference's two
-    # independent abs-distance computations and the single midpoint comparison
-    # legitimately diverge on that ~ULP tie. The tie is a sub-ULP boundary effect
-    # (it can also occur for fp32 values within ~1 ULP of a midpoint, including
-    # subnormals near a zero-midpoint); it only ever swaps two near-equidistant
-    # codewords, so it is immaterial. Random fp32/bf16 data (cases 1/1b, tens of
-    # millions of values) shows 0 disagreements.
+    # The exact-arithmetic chunking reproduces the old tie-break for both dtypes,
+    # so even fp32 midpoints (the worst case for a midpoint shortcut) are asserted
+    # bit-for-bit, not just bf16.
     mids = (cb256[:-1] + cb256[1:]) * 0.5
     _assert_parity(cb256, mids.bfloat16())
+    _assert_parity(cb256, mids.float())
 
     # --- 4. out-of-range values (below cb[0], above cb[-1]) --------------------
     oor = torch.tensor(

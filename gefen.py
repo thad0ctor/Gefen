@@ -94,7 +94,12 @@ def automatic_vmean_update(
 # bf16 param), which drove the full-FT OOM. Bounding the work to a fixed element
 # count caps the scratch independent of param size while keeping each kernel
 # launch large enough to stay GPU-bound (smaller chunks regress on launch
-# overhead). 8M elems -> ~100 MB scratch ceiling.
+# overhead). The exact gather/abs/where keeps several int64/fp32 temporaries live
+# per chunk (~40 bytes/elem), so 8M elems -> ~320 MB scratch ceiling (vs the
+# param-proportional ~40N of the old whole-tensor form -- multiple GiB on a large
+# embedding). The search runs ~10% slower than that whole-tensor form at this
+# chunk size; it is not the step bottleneck (Newton-Schulz dominates), and the
+# bounded scratch is what turns the full-FT OOM into a fit.
 GEFEN_CODEBOOK_SEARCH_CHUNK = 1 << 23
 
 
@@ -130,23 +135,15 @@ def gefen_nearest_codebook_indices(
         out.zero_()
         return out
 
-    # For a sorted codebook the nearest index of a value equals the number of
-    # interior midpoints below it: |v - cb[i]| <= |v - cb[i+1]| iff
-    # v <= (cb[i] + cb[i+1]) / 2. So a single searchsorted on the midpoints (with
-    # side='left', i.e. right=False) returns the nearest index directly and
-    # reproduces the old gather/abs/where tie-break (equal distance -> lower
-    # index), without that pipeline's full-size temporaries.
-    #
-    # Caveat: this matches the old result for all realistic inputs (validated bit
-    # for bit on tens of millions of random fp32/bf16 values, both dtypes the
-    # non-fused path actually produces -- plain-Gefen builds updated_m in fp32),
-    # but it is not provably identical at a sub-ULP tie: within ~1 ULP of a
-    # midpoint the old form's two independent abs-distance subtractions can round
-    # equal where `v <= mid` does not (or vice versa), flipping the assignment by
-    # one index. That only ever swaps two near-equidistant codewords, so the
-    # reconstruction error is bounded by the tie itself and is immaterial.
-    midpoints = (codebook[:-1] + codebook[1:]).mul(0.5)
-
+    # The original assignment -- searchsorted into the sorted codebook, then a
+    # gather/abs/where tie-break (nearest codeword; equal distance resolves to the
+    # lower index via `<=`) -- materialized ~10 full-size fp32/int64 temporaries
+    # (~40N bytes vs the 2N-byte bf16 param), which drove the full-FT OOM. We run
+    # that *exact* arithmetic one element-chunk at a time, so the result is
+    # bit-for-bit identical to the old whole-tensor form for every input dtype
+    # (including the plain-Gefen fp32 momentum path, whose quantized indices feed
+    # the next optimizer step -- so the trajectory is unchanged), while the
+    # int64/fp32 scratch is bounded to a single chunk instead of the whole tensor.
     flat_out = out.view(-1)
     flat_in = normalized_vals.reshape(-1)
     n = flat_in.numel()
@@ -154,8 +151,15 @@ def gefen_nearest_codebook_indices(
     for start in range(0, n, chunk):
         stop = start + chunk
         seg = flat_in[start:stop].float()
-        idx = torch.searchsorted(midpoints, seg, right=False)
-        flat_out[start:stop].copy_(idx.to(torch.uint8))
+        idx = torch.searchsorted(codebook, seg)
+        left = (idx - 1).clamp_(0, k - 1)
+        right = idx.clamp_(0, k - 1)
+        assign = torch.where(
+            (seg - codebook[left]).abs() <= (seg - codebook[right]).abs(),
+            left,
+            right,
+        )
+        flat_out[start:stop].copy_(assign.to(torch.uint8))
     return out
 
 
