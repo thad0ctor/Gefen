@@ -1,4 +1,5 @@
 import math
+from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
@@ -46,7 +47,7 @@ def automatic_partition_reduce(
 
 
 def automatic_vmean_update(
-    vmean: torch.Tensor,
+    vmean_f32: torch.Tensor,
     grad_view: torch.Tensor,
     beta2: float,
     *,
@@ -59,19 +60,20 @@ def automatic_vmean_update(
                     grad_view.device
                 )
             )
-        if vmean.device.type != "cuda":
+        if vmean_f32.device.type != "cuda":
             raise ValueError(
                 "FUSE_AUTOMATIC_VMEAN_UPDATE requires CUDA vmean, got device {}".format(
-                    vmean.device
+                    vmean_f32.device
                 )
             )
         from gefen.kernels.automatic_vmean import automatic_vmean_update_cuda
 
-        automatic_vmean_update_cuda(vmean, grad_view, beta2)
+        automatic_vmean_update_cuda(vmean_f32, grad_view, beta2)
         return
 
     block_mean_grad_sq = torch.mean(grad_view * grad_view, dim=1, keepdim=True)
-    vmean.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
+
+    vmean_f32.mul_(beta2).add_(block_mean_grad_sq, alpha=1 - beta2)
 
 
 def gefen_nearest_codebook_indices(
@@ -103,6 +105,7 @@ def gefen_dequantize_unpacked_indices(
     stored_indices: torch.Tensor,
     like_tensor: torch.Tensor,
 ) -> torch.Tensor:
+
     if codebook.device != stored_indices.device:
         raise ValueError(
             "Gefen codebook device {} does not match stored index device {}.".format(
@@ -308,6 +311,7 @@ class Gefen(torch.optim.Optimizer):
         fused: bool = True,
         verbose: bool = False,
     ):
+
         if fused and not torch.cuda.is_available():
             print(
                 "Gefen Optimizer:  got fused=True, but CUDA is not available. Changing fused to False."
@@ -463,7 +467,7 @@ class Gefen(torch.optim.Optimizer):
             )
         return gefen_nearest_codebook_indices(codebook, normalized_vals)
 
-    def _gefen_dequantize_m_coefficients(
+    def _gefen_dequantize_m_coefficients_notfused(
         self, state, like_tensor: torch.Tensor
     ) -> torch.Tensor:
 
@@ -625,6 +629,7 @@ class Gefen(torch.optim.Optimizer):
         reuse_existing_periods: bool = False,
         compute_mse_logging: bool = True,
     ) -> Optional[torch.Tensor]:
+
         codebook = learn_gefen_exact_codebook_from_grad_periods(
             grad_periods=self._iter_gefen_grad_periods(
                 reuse_existing_periods=reuse_existing_periods
@@ -643,8 +648,10 @@ class Gefen(torch.optim.Optimizer):
 
     def _ensure_gefen_codebook(self, reuse_existing_periods: bool = False) -> None:
         compute_mse_logging = False
+
         if "COMPUTE_GEFEN_EXACT_MSE_LOGGING" in globals():
             compute_mse_logging = COMPUTE_GEFEN_EXACT_MSE_LOGGING
+
         codebook = self._learn_gefen_exact_codebook(
             reuse_existing_periods=reuse_existing_periods,
             compute_mse_logging=compute_mse_logging,
@@ -652,9 +659,26 @@ class Gefen(torch.optim.Optimizer):
         if codebook is not None:
             self._gefen_codebook = codebook
 
+    def _has_restored_automatic_periods(self) -> bool:
+
+        return any(
+            "automatic_period" in self.state.get(p, {})
+            for group in self.param_groups
+            for p in group["params"]
+        )
+
     def _maybe_refresh_gefen_codebook(self) -> None:
-        if self._gefen_codebook is None:
-            self._ensure_gefen_codebook()
+
+        if self._gefen_codebook is not None:
+
+            device = self._gefen_codebook_device()
+            if self._gefen_codebook.device != device:
+                self._gefen_codebook = self._gefen_codebook.to(device)
+            return
+
+        self._ensure_gefen_codebook(
+            reuse_existing_periods=self._has_restored_automatic_periods()
+        )
 
     def _maybe_save_gefen_grad_histogram(self) -> None:
         if not hasattr(quantization_module, "LIST_STEPS_SAVE_HIST_GRAD"):
@@ -746,9 +770,10 @@ class Gefen(torch.optim.Optimizer):
             lr=lr,
         )
 
-    def _automatic_momentum_update(
+    def _automatic_momentum_update_nonfused(
         self, state, grad_view: torch.Tensor, beta1: float
     ) -> torch.Tensor:
+
         if grad_view.dim() != 2:
             raise ValueError(
                 "Automatic shared momentum expects a 2D tensor, got dim={}".format(
@@ -757,21 +782,26 @@ class Gefen(torch.optim.Optimizer):
             )
 
         period = state["automatic_period"]
-        current_m = (
-            self._gefen_dequantize_m_coefficients(state, grad_view)
+        current_m_fp32 = (
+            self._gefen_dequantize_m_coefficients_notfused(state, grad_view)
             * state["m_magnitude"]
         )
-        updated_m = current_m.lerp(grad_view, 1 - beta1)
+
+        updated_m_fp32 = current_m_fp32.lerp(
+            grad_view.to(current_m_fp32.dtype), 1 - beta1
+        )
 
         state["m_magnitude"].copy_(
-            self._automatic_reduce(updated_m.abs().reshape(-1), period, reduce_op="max")
+            self._automatic_reduce(
+                updated_m_fp32.abs().reshape(-1), period, reduce_op="max"
+            )
         )
 
         nonzero_mask = state["m_magnitude"] > 0
-        updated_m.div_(state["m_magnitude"])
-        updated_m.masked_fill_(~nonzero_mask, 0.0)
+        updated_m_fp32.div_(state["m_magnitude"])
+        updated_m_fp32.masked_fill_(~nonzero_mask, 0.0)
 
-        indices = self._gefen_nearest_indices(updated_m)
+        indices = self._gefen_nearest_indices(updated_m_fp32)
         self._gefen_set_indices(state, indices)
 
         codebook = self._gefen_codebook
@@ -871,7 +901,7 @@ class Gefen(torch.optim.Optimizer):
 
             return
 
-        shared_m = self._automatic_momentum_update(state, grad_view, beta1)
+        shared_m = self._automatic_momentum_update_nonfused(state, grad_view, beta1)
         update = (shared_m * stepsize).view(grad.size())
         update.mul_(lr)
         if not self.fused and hasattr(p, "to_local") and hasattr(p, "placements"):
@@ -888,14 +918,56 @@ class Gefen(torch.optim.Optimizer):
         return total
 
     def state_dict(self):
+
         state_dict = super().state_dict()
         state_dict["gefen_global_step"] = self._gefen_global_step
+
+        state_dict["gefen_codebook"] = self._gefen_codebook
         return state_dict
 
     def load_state_dict(self, state_dict):
+
+        state_dict = dict(state_dict)
+
         gefen_global_step = state_dict.pop("gefen_global_step", 0)
+
+        saved_state = state_dict.get("state", {}) or {}
+
+        gefen_codebook = state_dict.pop("gefen_codebook", None)
+
         super().load_state_dict(state_dict)
         self._gefen_global_step = gefen_global_step
+
+        self._gefen_codebook = gefen_codebook
+
+        id_map = dict(
+            zip(
+                chain.from_iterable(
+                    group["params"] for group in state_dict["param_groups"]
+                ),
+                chain.from_iterable(group["params"] for group in self.param_groups),
+            )
+        )
+        for param_id, saved_param_state in saved_state.items():
+            param = id_map.get(param_id)
+            if param is None:
+                continue
+            live_state = self.state.get(param)
+            if live_state is None:
+                continue
+            for key, saved_value in saved_param_state.items():
+                if not torch.is_tensor(saved_value):
+                    continue
+                live_value = live_state.get(key)
+                if (
+                    torch.is_tensor(live_value)
+                    and live_value.dtype == saved_value.dtype
+                ):
+                    continue
+                device = (
+                    live_value.device if torch.is_tensor(live_value) else param.device
+                )
+                live_state[key] = saved_value.to(device=device, dtype=saved_value.dtype)
 
     @torch.no_grad()
     def step(self, closure=None):

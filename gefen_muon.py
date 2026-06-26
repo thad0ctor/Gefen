@@ -178,7 +178,9 @@ class GefenMuon(Gefen):
             dummy_stepsize,
             0.0,
         )
-        quantized_momentum = self._gefen_dequantize_m_coefficients(state, grad_view)
+        quantized_momentum = self._gefen_dequantize_m_coefficients_notfused(
+            state, grad_view
+        )
         quantized_momentum.mul_(state["m_magnitude"])
         return quantized_momentum
 
@@ -247,7 +249,9 @@ class GefenMuon(Gefen):
                 momentum,
             )
         else:
-            momentum_update = self._gefen_dequantize_m_coefficients(state, grad_view)
+            momentum_update = self._gefen_dequantize_m_coefficients_notfused(
+                state, grad_view
+            )
             momentum_update.mul_(state["m_magnitude"])
             momentum_update.lerp_(grad_view, 1 - momentum)
             self._quantize_momentum_(state, momentum_update)
