@@ -67,9 +67,13 @@ print('Finished successfully.')
 ### Learning rate (when porting an AdamW config)
 
 Gefen matches AdamW's *interface*, but it needs a **lower learning rate** —
-roughly **0.6× AdamW's** in our testing. **At its own optimal LR, Gefen matches
-AdamW's loss and run-to-run reproducibility**, while keeping its optimizer-memory
-advantage; reused at AdamW's LR unchanged, it over-steps.
+about **0.6× AdamW's** on the architectures we tested (Qwen3, i.e. SwiGLU MLP +
+grouped-query attention). This factor is **model-specific**, not a universal
+constant — it is set by the model's RMSNorm/block structure (see below), so treat
+0.6× as a starting point for Qwen3-family decoders and measure it for anything
+else. **At its own optimal LR, Gefen matches AdamW's loss and run-to-run
+reproducibility**, while keeping its optimizer-memory advantage; reused at AdamW's
+LR unchanged, it over-steps.
 
 Why: Gefen's second moment is a *block-shared* RMS of the gradient rather than
 AdamW's per-element `√v`. Globally the two take similar-magnitude steps, but on a
@@ -97,6 +101,13 @@ does *not* tolerate raising the LR back up. The exact factor is set by the
 architecture's RMSNorm/block structure, so confirm on your own model — the simplest
 check is to compute, on a warmed AdamW state, `‖m̂/(√v̂+ε)‖ / ‖m̂/(√blockmean(v̂)+ε)‖`
 for the norm-weight tensors; that ratio is the LR scale factor.
+
+**If your recipe uses a nonzero `weight_decay`:** AdamW (and Gefen) apply
+*decoupled* weight decay, so the per-step regularization is `lr × weight_decay`.
+Scaling `lr` down to ~0.6× therefore weakens decay by the same factor. To hold
+regularization constant, scale `weight_decay` up correspondingly (≈ `1 / 0.6`), or
+retune it. (Our measurements used `weight_decay = 0`, so this follows from the
+decoupled-decay definition rather than direct testing.)
 
 ## Hugging Face Trainer
 
