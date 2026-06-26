@@ -75,9 +75,27 @@ def _make(numel, period, dtype, device, seed, scale=1.0):
     return p, gv, ms, mm, ss
 
 
+def _bits(t):
+    # Reinterpret float bits as same-width ints so the comparison is truly
+    # bit-for-bit -- no collapsing of +0/-0, NaN payloads, or signed NaNs, and no
+    # bf16/fp16 information loss from an intermediate float() cast. Integer dtypes
+    # (e.g. the uint8 indices) pass through unchanged.
+    t = t.contiguous()
+    if t.dtype in (torch.bfloat16, torch.float16):
+        return t.view(torch.int16)
+    if t.dtype == torch.float32:
+        return t.view(torch.int32)
+    if t.dtype == torch.float64:
+        return t.view(torch.int64)
+    return t
+
+
 def _bit_equal(a, b):
-    # Exact, but NaN==NaN and Inf==Inf count as equal (for the edge-input test).
-    return bool(((a == b) | (torch.isnan(a) & torch.isnan(b))).all().item())
+    # v1 and v2 run the identical float ops, so their outputs must match to the
+    # exact bit pattern (including NaN payloads / signed zeros), in native dtype.
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    return bool((_bits(a) == _bits(b)).all().item())
 
 
 def _run(mod, v2, p, gv, ms, mm, ss, cb):
@@ -103,7 +121,7 @@ def parity(device):
         p, gv, ms, mm, ss = _make(numel, period, DTYPES[dt_name], device, 100 + (numel % 97))
         p1, ms1, mm1 = _run(mod, False, p, gv, ms, mm, ss, cb)
         p2, ms2, mm2 = _run(mod, True, p, gv, ms, mm, ss, cb)
-        good = _bit_equal(p1.float(), p2.float()) and _bit_equal(mm1, mm2) and _bit_equal(ms1.int(), ms2.int())
+        good = _bit_equal(p1, p2) and _bit_equal(mm1, mm2) and _bit_equal(ms1, ms2)
         ok = ok and good
         if not good:
             fails += 1
@@ -180,7 +198,7 @@ def edge_parity(device):
             flat[n // 3] = float("nan")
         p1, ms1, mm1 = _run(mod, False, p, gv, ms, mm, ss, cb)
         p2, ms2, mm2 = _run(mod, True, p, gv, ms, mm, ss, cb)
-        good = _bit_equal(p1.float(), p2.float()) and _bit_equal(mm1, mm2) and _bit_equal(ms1.int(), ms2.int())
+        good = _bit_equal(p1, p2) and _bit_equal(mm1, mm2) and _bit_equal(ms1, ms2)
         ok = ok and good
         if not good:
             print(f"  [edge FAIL] numel={numel} period={period}")
@@ -215,6 +233,8 @@ def guards(device):
         p.clone(), gv, ms.clone(), mm.clone(), ss, cb, True, BETA1, LR))
     expect_raise("m_magnitude not f32", lambda: mod.automatic_gefen_fused_update_v2_cuda(
         p.clone(), gv, ms.clone(), mm.clone().half(), ss, cb, False, BETA1, LR))
+    expect_raise("stepsize not f32", lambda: mod.automatic_gefen_fused_update_v2_cuda(
+        p.clone(), gv, ms.clone(), mm.clone(), ss.half(), cb, False, BETA1, LR))
 
     ok = all(passed for _, passed in checks)
     print(f"[4] v2 input guards raise: {sum(p for _, p in checks)}/{len(checks)} -> {'PASS' if ok else 'FAIL'}")
@@ -231,7 +251,7 @@ def repeatability(device, runs=5):
         ref = _run(mod, True, p, gv, ms, mm, ss, cb)
         for _ in range(runs - 1):
             cur = _run(mod, True, p, gv, ms, mm, ss, cb)
-            same = all(_bit_equal(a.float(), b.float()) for a, b in zip(ref, cur))
+            same = all(_bit_equal(a, b) for a, b in zip(ref, cur))
             ok = ok and same
             if not same:
                 print(f"  [repeat FAIL] numel={numel} period={period}")
