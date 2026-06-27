@@ -188,20 +188,26 @@ def case_fused_cuda():
     import os as _os
     import sys as _sys
 
-    _sys.path[:] = [
-        pth
-        for pth in _sys.path
-        if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
-    ]
+    # Scope the mutation: this runs in the pytest process, so restore sys.path
+    # afterwards to avoid leaking into later tests.
+    _original_sys_path = _sys.path[:]
+    try:
+        _sys.path[:] = [
+            pth
+            for pth in _sys.path
+            if not _os.path.isfile(_os.path.join(pth or ".", "gefen.py"))
+        ]
 
-    import torch.distributed as dist
-    from torch.distributed.tensor import (
-        Shard,
-        distribute_tensor,
-        init_device_mesh,
-    )
+        import torch.distributed as dist
+        from torch.distributed.tensor import (
+            Shard,
+            distribute_tensor,
+            init_device_mesh,
+        )
 
-    from gefen.gefen_muon import GefenMuon
+        from gefen.gefen_muon import GefenMuon
+    finally:
+        _sys.path[:] = _original_sys_path
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29714")
