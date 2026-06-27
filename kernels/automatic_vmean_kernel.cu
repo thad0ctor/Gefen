@@ -9,6 +9,28 @@
 
 namespace {
 
+// Cache the per-device SM count: cudaDeviceGetAttribute is a driver round-trip
+// the period==1 launch path otherwise pays every step per param, and the value
+// is constant for the process. Writes are idempotent so the lazy fill is lock-free.
+int cached_sm_count(int device_id) {
+    constexpr int kMaxDevices = 64;
+    static int cache[kMaxDevices] = {0};
+    static bool valid[kMaxDevices] = {false};
+    if (device_id >= 0 && device_id < kMaxDevices && valid[device_id]) {
+        return cache[device_id];
+    }
+    int sm = 0;
+    cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device_id);
+    if (sm < 1) {
+        sm = 1;
+    }
+    if (device_id >= 0 && device_id < kMaxDevices) {
+        cache[device_id] = sm;
+        valid[device_id] = true;
+    }
+    return sm;
+}
+
 template <typename scalar_t>
 __global__ void automatic_vmean_update_kernel(
     float* __restrict__ vmean,
@@ -120,11 +142,7 @@ void automatic_vmean_update_cuda(
 
     if (period == 1) {
         const int threads = 256;
-        int device_id = 0;
-        cudaGetDevice(&device_id);
-        int sm_count = 0;
-        cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
-        if (sm_count < 1) sm_count = 1;
+        const int sm_count = cached_sm_count(vmean.get_device());
         int64_t nblocks = (num_blocks + threads - 1) / threads;
         const int64_t cap = static_cast<int64_t>(sm_count) * 32;
         if (nblocks > cap) nblocks = cap;

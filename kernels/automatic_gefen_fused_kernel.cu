@@ -11,6 +11,29 @@
 
 namespace {
 
+// Cache the per-device SM count: cudaDeviceGetAttribute is a driver round-trip
+// that the v2 launch path otherwise pays on every step per param, and the value
+// is constant for the life of the process. Writes are idempotent so the lazy
+// fill needs no lock.
+int cached_sm_count(int device_id) {
+    constexpr int kMaxDevices = 64;
+    static int cache[kMaxDevices] = {0};
+    static bool valid[kMaxDevices] = {false};
+    if (device_id >= 0 && device_id < kMaxDevices && valid[device_id]) {
+        return cache[device_id];
+    }
+    int sm = 0;
+    cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, device_id);
+    if (sm < 1) {
+        sm = 1;
+    }
+    if (device_id >= 0 && device_id < kMaxDevices) {
+        cache[device_id] = sm;
+        valid[device_id] = true;
+    }
+    return sm;
+}
+
 __device__ __forceinline__ uint8_t unpack_codebook_index(
     const uint8_t* __restrict__ packed_indices,
     int64_t logical_idx,
@@ -104,7 +127,16 @@ __global__ void automatic_gefen_fused_update_kernel(
     float beta1,
     float lr
 ) {
-    extern __shared__ float shared_max[];
+    // Shared layout: [codebook_size floats codebook] then [blockDim.x floats max].
+    // Staging the (<=256-entry) codebook once per block keeps the per-element
+    // coeff gather and the binary search in the quantize loop off global memory.
+    extern __shared__ float smem[];
+    float* s_codebook = smem;
+    float* shared_max = smem + codebook_size;
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
 
     const int64_t block_idx = static_cast<int64_t>(blockIdx.x);
     if (block_idx >= num_blocks) {
@@ -118,7 +150,7 @@ __global__ void automatic_gefen_fused_update_kernel(
 
     for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
         const int64_t idx = start + offset;
-        const float coeff = codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
+        const float coeff = s_codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
         const float current_m = old_magnitude * coeff;
         const float grad_value = static_cast<float>(grad_view[idx]);
         const float updated_value = beta1 * current_m + (1.0f - beta1) * grad_value;
@@ -149,17 +181,17 @@ __global__ void automatic_gefen_fused_update_kernel(
     for (int64_t offset = threadIdx.x; offset < period; offset += blockDim.x) {
         const int64_t idx = start + offset;
         float normalized_value = 0.0f;
-        const float coeff = codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
+        const float coeff = s_codebook[static_cast<int>(unpack_codebook_index(m_sign, idx, packed_indices))];
         const float current_m = old_magnitude * coeff;
         const float grad_value = static_cast<float>(grad_view[idx]);
         const float updated_value = beta1 * current_m + (1.0f - beta1) * grad_value;
         if (new_magnitude > 0.0f) {
             normalized_value = updated_value / new_magnitude;
         }
-        const uint8_t quantized_index = nearest_codebook_index(normalized_value, codebook, codebook_size);
+        const uint8_t quantized_index = nearest_codebook_index(normalized_value, s_codebook, codebook_size);
         store_packed_codebook_index(m_sign, idx, quantized_index, packed_indices);
         if (lr != 0.0f) {
-            const float quantized_value = codebook[static_cast<int>(quantized_index)] * new_magnitude;
+            const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_magnitude;
             const float update_value = quantized_value * step * lr;
             p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
         }
@@ -239,16 +271,22 @@ __global__ void gefen_magnitude_flat_kernel(
     const float* __restrict__ old_magnitude,
     const float* __restrict__ codebook,
     float* __restrict__ new_magnitude,
+    int codebook_size,
     int64_t period,
     int64_t total_numel,
     float beta1
 ) {
+    extern __shared__ float s_codebook[];
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          idx < total_numel; idx += stride) {
         const int64_t block_idx = idx / period;
         const float updated = updated_momentum(
-            grad_view, m_sign, codebook, old_magnitude[block_idx], idx, beta1);
+            grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
         atomic_max_nonneg(&new_magnitude[block_idx], fabsf(updated));
     }
 }
@@ -263,12 +301,20 @@ __global__ void gefen_magnitude_split_kernel(
     const float* __restrict__ old_magnitude,
     const float* __restrict__ codebook,
     float* __restrict__ new_magnitude,
+    int codebook_size,
     int64_t period,
     int64_t num_blocks,
     int blocks_per_row,
     float beta1
 ) {
-    extern __shared__ float shared_max[];
+    // Shared: [blockDim.x reduction max] then [codebook_size staged codebook].
+    extern __shared__ float smem[];
+    float* shared_max = smem;
+    float* s_codebook = smem + blockDim.x;
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
     const int64_t row = static_cast<int64_t>(blockIdx.x) / blocks_per_row;
     const int sub = static_cast<int>(static_cast<int64_t>(blockIdx.x) % blocks_per_row);
     if (row >= num_blocks) {
@@ -280,7 +326,7 @@ __global__ void gefen_magnitude_split_kernel(
     for (int64_t offset = static_cast<int64_t>(sub) * blockDim.x + threadIdx.x;
          offset < period; offset += static_cast<int64_t>(blocks_per_row) * blockDim.x) {
         const float updated = updated_momentum(
-            grad_view, m_sign, codebook, old_mag, row_start + offset, beta1);
+            grad_view, m_sign, s_codebook, old_mag, row_start + offset, beta1);
         const float a = fabsf(updated);
         if (a > local_absmax) {
             local_absmax = a;
@@ -316,22 +362,27 @@ __global__ void gefen_update_flat_kernel(
     float beta1,
     float lr
 ) {
+    extern __shared__ float s_codebook[];
+    for (int i = threadIdx.x; i < codebook_size; i += blockDim.x) {
+        s_codebook[i] = codebook[i];
+    }
+    __syncthreads();
     const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
     for (int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          idx < total_numel; idx += stride) {
         const int64_t block_idx = idx / period;
         const float new_mag = new_magnitude[block_idx];
         const float updated = updated_momentum(
-            grad_view, m_sign, codebook, old_magnitude[block_idx], idx, beta1);
+            grad_view, m_sign, s_codebook, old_magnitude[block_idx], idx, beta1);
         float normalized_value = 0.0f;
         if (new_mag > 0.0f) {
             normalized_value = updated / new_mag;
         }
         const uint8_t quantized_index =
-            nearest_codebook_index(normalized_value, codebook, codebook_size);
+            nearest_codebook_index(normalized_value, s_codebook, codebook_size);
         m_sign[idx] = quantized_index;
         if (lr != 0.0f) {
-            const float quantized_value = codebook[static_cast<int>(quantized_index)] * new_mag;
+            const float quantized_value = s_codebook[static_cast<int>(quantized_index)] * new_mag;
             const float update_value = quantized_value * stepsize[block_idx] * lr;
             p[idx] = static_cast<scalar_t>(static_cast<float>(p[idx]) - update_value);
         }
@@ -410,7 +461,9 @@ void automatic_gefen_fused_update_cuda(
     const int threads = choose_threads(period);
     const dim3 grid(static_cast<unsigned int>(num_blocks));
     const dim3 block(static_cast<unsigned int>(threads));
-    const size_t shared_bytes = static_cast<size_t>(threads) * sizeof(float);
+    // Shared holds the staged codebook (<=256) plus the per-thread reduction max.
+    const size_t shared_bytes =
+        (static_cast<size_t>(threads) + static_cast<size_t>(codebook.numel())) * sizeof(float);
 
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::kHalf,
@@ -498,13 +551,10 @@ void automatic_gefen_fused_update_v2_cuda(
 
     const int codebook_size = static_cast<int>(codebook.numel());
     const int threads = 256;
-    int device_id = 0;
-    cudaGetDevice(&device_id);
-    int sm_count = 0;
-    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
-    if (sm_count < 1) sm_count = 1;
+    const int sm_count = cached_sm_count(p.get_device());
     // Target a few thousand resident blocks for the flat phases.
     const int64_t flat_blocks_cap = static_cast<int64_t>(sm_count) * 32;
+    const size_t codebook_bytes = static_cast<size_t>(codebook_size) * sizeof(float);
 
     // Phase 1: per-block magnitude (absmax of updated momentum).
     AT_DISPATCH_FLOATING_TYPES_AND2(
@@ -514,10 +564,10 @@ void automatic_gefen_fused_update_v2_cuda(
                 int64_t nblocks = (total_numel + threads - 1) / threads;
                 if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
                 if (nblocks < 1) nblocks = 1;
-                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads>>>(
+                gefen_magnitude_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
-                    new_magnitude.data_ptr<float>(), period, total_numel,
+                    new_magnitude.data_ptr<float>(), codebook_size, period, total_numel,
                     static_cast<float>(beta1));
             } else {
                 int blocks_per_row = static_cast<int>((period + threads * 64 - 1) / (threads * 64));
@@ -527,11 +577,11 @@ void automatic_gefen_fused_update_v2_cuda(
                 if (blocks_per_row > max_bpr && max_bpr >= 1) blocks_per_row = max_bpr;
                 if (blocks_per_row < 1) blocks_per_row = 1;
                 const int64_t grid = num_blocks * blocks_per_row;
-                const size_t shmem = static_cast<size_t>(threads) * sizeof(float);
+                const size_t shmem = static_cast<size_t>(threads) * sizeof(float) + codebook_bytes;
                 gefen_magnitude_split_kernel<scalar_t><<<static_cast<unsigned int>(grid), threads, shmem>>>(
                     grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                     m_magnitude.data_ptr<float>(), codebook.data_ptr<float>(),
-                    new_magnitude.data_ptr<float>(), period, num_blocks, blocks_per_row,
+                    new_magnitude.data_ptr<float>(), codebook_size, period, num_blocks, blocks_per_row,
                     static_cast<float>(beta1));
             }
         });
@@ -544,7 +594,7 @@ void automatic_gefen_fused_update_v2_cuda(
             int64_t nblocks = (total_numel + threads - 1) / threads;
             if (nblocks > flat_blocks_cap) nblocks = flat_blocks_cap;
             if (nblocks < 1) nblocks = 1;
-            gefen_update_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads>>>(
+            gefen_update_flat_kernel<scalar_t><<<static_cast<unsigned int>(nblocks), threads, codebook_bytes>>>(
                 p.data_ptr<scalar_t>(), grad_view.data_ptr<scalar_t>(), m_sign.data_ptr<uint8_t>(),
                 m_magnitude.data_ptr<float>(), new_magnitude.data_ptr<float>(),
                 stepsize.data_ptr<float>(), codebook.data_ptr<float>(), codebook_size,
