@@ -1468,10 +1468,21 @@ class Gefen(torch.optim.Optimizer):
         period = state.get("automatic_period")
         if period is None:
             return None
-        local_numel = p.grad.reshape(-1).numel()
+        grad = p.grad
+        local_numel = grad.reshape(-1).numel()
+        # Every merge invariant must be in the key. step: _step_automatic_merged
+        # uses one state's bias correction for the whole batch, so params at
+        # different step counts (e.g. one whose grad was None on a prior step)
+        # must not group. device/dtype: merged buffers only combine compatible
+        # tensors.
         return (
+            p.device,
+            p.dtype,
+            grad.device,
+            grad.dtype,
             local_numel,
             period,
+            state["step"],
             group["beta1"],
             group["beta2"],
             float(lr),
@@ -1713,7 +1724,14 @@ class Gefen(torch.optim.Optimizer):
 
         # The fused path has its own batched CUDA kernel per param; only the
         # non-fused Python-loop path benefits from foreach/merged batching.
-        batch_nonfused = not self._use_fused_gefen_automatic_step()
+        # Gate on BOTH fused flags: the merged path hard-codes use_fused=False for
+        # the vmean update, so it must not engage while fused vmean is still on
+        # (e.g. FUSE_GEFEN_AUTOMATIC_STEP off but FUSE_AUTOMATIC_VMEAN_UPDATE on),
+        # which would otherwise change the vmean math vs the per-param path.
+        batch_nonfused = (
+            not self._use_fused_gefen_automatic_step()
+            and not self._use_fused_automatic_vmean()
+        )
 
         # Collect parameters that share block geometry + hyperparameters so they
         # can be processed as one merged tensor (see _step_automatic_merged).
