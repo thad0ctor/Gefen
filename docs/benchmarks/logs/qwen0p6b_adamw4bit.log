@@ -1,0 +1,49 @@
+[gpu] CUDA_VISIBLE_DEVICES=1 -> NVIDIA GeForce RTX 3090 Ti
+W0627 12:43:51.274000 3982293 torch/utils/_pytree.py:630] <enum 'KernelPreference'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+W0627 12:43:51.292000 3982293 torch/utils/_pytree.py:630] <enum 'ScaleCalculationMode'> is an Enum subclass and is now natively supported by torch.compile as an opaque value type. Calling register_constant() on Enum subclasses is deprecated and will be an error in a future release.
+Loading weights:   0%|          | 0/311 [00:00<?, ?it/s]Loading weights: 100%|██████████| 311/311 [00:00<00:00, 13244.41it/s]
+=== qwen0p6b adamw4bit lr=5.000e-05 seed=0 steps=2000 seq=2048 params=0.596B ===
+step 0  eval_loss 2.9911
+<venv>/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/autograd_cache.py:542: UserWarning: OptimState4bit does not implement _stable_hash_for_caching. For PT2-compatible tensor subclasses, it is recommended to implement _stable_hash_for_caching(self) -> str for stable AOT autograd caching.
+  warn_once(
+step 50  train_ema 1.7218  eval 1.7425  4064 tok/s
+step 100  train_ema 1.6374  eval 1.6159  4034 tok/s
+step 150  train_ema 1.6286  eval 1.5913  4073 tok/s
+step 200  train_ema 1.6053  eval 1.5739  4052 tok/s
+step 250  train_ema 1.6334  eval 1.6010  4068 tok/s
+step 300  train_ema 1.6533  eval 1.5820  3943 tok/s
+step 350  train_ema 1.6103  eval 1.5837  2435 tok/s
+step 400  train_ema 1.5873  eval 1.5812  4006 tok/s
+step 450  train_ema 1.6400  eval 1.5700  4056 tok/s
+step 500  train_ema 1.5643  eval 1.5219  3999 tok/s
+step 550  train_ema 1.6499  eval 1.5717  3999 tok/s
+step 600  train_ema 1.6286  eval 1.5787  3970 tok/s
+step 650  train_ema 1.5781  eval 1.5798  4006 tok/s
+step 700  train_ema 1.6084  eval 1.5275  4022 tok/s
+step 750  train_ema 1.6414  eval 1.5549  4004 tok/s
+step 800  train_ema 1.6365  eval 1.6143  4042 tok/s
+step 850  train_ema 1.6066  eval 1.5835  4032 tok/s
+step 900  train_ema 1.5803  eval 1.5692  4070 tok/s
+step 950  train_ema 1.6192  eval 1.5724  4043 tok/s
+step 1000  train_ema 1.6326  eval 1.5430  4068 tok/s
+step 1050  train_ema 1.6538  eval 1.5464  4050 tok/s
+step 1100  train_ema 1.6125  eval 1.6134  4056 tok/s
+step 1150  train_ema 1.6168  eval 1.6101  4056 tok/s
+step 1200  train_ema 1.5969  eval 1.5666  4009 tok/s
+step 1250  train_ema 1.6260  eval 1.5864  4069 tok/s
+step 1300  train_ema 1.6181  eval 1.6000  4079 tok/s
+step 1350  train_ema 1.6330  eval 1.6244  4081 tok/s
+step 1400  train_ema 1.6187  eval 1.6376  4076 tok/s
+step 1450  train_ema 1.6199  eval 1.6414  4093 tok/s
+step 1500  train_ema 1.5807  eval 1.6094  4111 tok/s
+step 1550  train_ema 1.5610  eval 1.5724  4080 tok/s
+step 1600  train_ema 1.6301  eval 1.5519  4086 tok/s
+step 1650  train_ema 1.6200  eval 1.4806  4131 tok/s
+step 1700  train_ema 1.6751  eval 1.4972  4139 tok/s
+step 1750  train_ema 1.6380  eval 1.4890  4132 tok/s
+step 1800  train_ema 1.6154  eval 1.4706  4109 tok/s
+step 1850  train_ema 1.6170  eval 1.4730  4107 tok/s
+step 1900  train_ema 1.6151  eval 1.4443  4080 tok/s
+step 1950  train_ema 1.6288  eval 1.4727  4146 tok/s
+step 2000  train_ema 1.6144  eval 1.4437  4126 tok/s
+RESULT {"tag": "qwen0p6b", "opt": "adamw4bit", "lr": 5e-05, "seed": 0, "steps": 2000, "seq": 2048, "params_B": 0.596, "gpu": "NVIDIA GeForce RTX 3090 Ti", "final_train_ema": 1.6144, "eval0": 2.9911, "final_eval": 1.4437, "tok_per_s": 4005.4, "peak_vram_gib": 6.32, "opt_state_bpp": 1.063, "opt_state_gib": 0.59}

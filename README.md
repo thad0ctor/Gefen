@@ -1,5 +1,29 @@
 # [Gefen: Optimized Stochastic Optimizer](https://arxiv.org/pdf/2606.13894)
 
+> ### This fork — `thad0ctor/Gefen-X`
+> A fork of [upstream Gefen](https://github.com/ndvbd/Gefen) that **fixes several
+> critical gaps in the shipped release and adds modern-architecture support.**
+> Top-level highlights:
+>
+> - **🏗️ Modern decoders (SwiGLU MLP + grouped-query attention — Qwen3, Llama-3, Mistral, …).**
+>   Shipped Gefen's block-period detector collapses to `period==1` on these
+>   architectures, falling back to per-element fp32 state (**~9 B/param — *worse*
+>   than AdamW's 8**). A memory-safe coarse fallback restores the intended
+>   **~1 B/param**, with documented learning-rate guidance (Gefen's block-shared
+>   2nd moment needs a lower LR than AdamW — see
+>   [Learning rate](#learning-rate-when-porting-an-adamw-config)).
+> - **⚡ ~2× faster `opt.step()`, bit-exact.** A fused-kernel rewrite folds the
+>   2nd-moment update, step-size, and weight decay into the update kernel with
+>   occupancy-aware v1/v2 dispatch — removing ~half the per-step kernel launches
+>   and a full gradient pass.
+> - **💾 Correct checkpoint/resume** (dtype-on-load, block-period persistence) and
+>   **FSDP2 `fused=True` support** — broken / absent in the shipped release.
+> - **🛡️ Robustness hardening:** same-device/dtype guards before raw-pointer
+>   kernel launches, thread-safe SM-count caches, codebook & empty-tensor bounds checks.
+>
+> See **[Benchmarks](#benchmarks)** for a fair optimizer comparison (loss · speed ·
+> memory) with raw logs. The upstream README follows.
+
 Gefen is a drop-in replacement for the AdamW optimizer for memory-efficient
 training. It keeps the familiar AdamW training recipe while dramatically
 reducing optimizer-state memory: an 8x reduction in AdamW memory footprint, or
@@ -11,27 +35,30 @@ optimizer constructor.
 
 ## Installation
 
-Install from PyPI:
+> **This fork is not on PyPI.** `pip install gefen` fetches the *upstream*
+> release, which does **not** include the fixes/improvements above — install this
+> fork from source instead.
+
+Build from source (editable install):
 
 ```bash
-pip install gefen
+git clone https://github.com/thad0ctor/Gefen-X
+cd Gefen-X
+pip install -e .          # imports as `gefen`; the fix series lives on the perf branches
 ```
 
-Or install from source:
+The package is pure-Python at install time — the fused CUDA kernels are **built
+on first use** via PyTorch JIT (`torch.utils.cpp_extension`) + `nvcc`. The first
+CUDA run takes a few minutes; later runs reuse the cached build keyed on your
+Python / PyTorch / CUDA version and the Gefen source checkout. Force a rebuild
+with `GEFEN_FORCE_REBUILD=1`.
 
-```bash
-git clone https://github.com/ndvbd/Gefen
-cd Gefen
-pip install -e .
-```
-
-On the first CUDA run, Gefen builds its fused CUDA kernels with PyTorch JIT and
-`nvcc`. This can take a few minutes. Later runs reuse the cached build for the
-same Python, PyTorch, CUDA version, and Gefen source checkout.
-
-This keeps the source install lightweight, but it requires a CUDA toolkit and
-host compiler compatible with your PyTorch installation. In the future, we plan
-to make this smoother with prebuilt wheels for common PyTorch/CUDA combinations.
+**Requirements:** a CUDA toolkit and host compiler compatible with your PyTorch
+build (the JIT compiles for your GPU's compute capability — e.g. `sm_86` for
+RTX 3090, `sm_120` for RTX 5090; set `TORCH_CUDA_ARCH_LIST` to target others or a
+multi-arch fat binary). Verified with **PyTorch 2.12 (cu133) / Python 3.12**.
+Optional baselines used in the benchmark: `bitsandbytes` (AdamW-8bit),
+`torchao` (AdamW-4bit).
 
 ## Quick Start
 
@@ -151,8 +178,12 @@ clear optimizer-state edge is over 8-bit (2.03) and bf16 (4.00).
 
 *Caveats:* single seed; the `5e-5`/`2e-5` LRs are 175-step optima (the 2000-step
 optimum is likely lower for every optimizer); `adamw4bit` was run at the
-AdamW-family `5e-5` (its own 4-bit optimum was not separately swept). Raw data:
-`docs/benchmarks/optimizer_comparison_2000steps.csv`.
+AdamW-family `5e-5` (its own 4-bit optimum was not separately swept).
+
+**Review the raw runs:** per-cell training logs (step-by-step loss, throughput,
+VRAM) in [`docs/benchmarks/logs/`](docs/benchmarks/logs/) · aggregated metrics as
+[CSV](docs/benchmarks/optimizer_comparison_2000steps.csv) and
+[JSONL](docs/benchmarks/optimizer_comparison_2000steps.jsonl).
 
 ## Hugging Face Trainer
 
