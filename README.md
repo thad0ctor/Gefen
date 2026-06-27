@@ -24,6 +24,26 @@
 > See **[Benchmarks](#benchmarks)** for a fair optimizer comparison (loss · speed ·
 > memory) with raw logs. The upstream README follows.
 
+<details>
+<summary><b>Fork Improvements</b> (vs upstream)</summary>
+
+| Capability | Upstream v1.1.1 | This fork |
+|---|---|---|
+| Modern decoders (Qwen3 / Llama-3 / Mistral — SwiGLU + grouped-query attention) | uses *more* optimizer memory than AdamW on these | keeps the full ~8× memory saving |
+| Learning rate on those architectures | no guidance — silently over-steps | documented ~0.6× AdamW, so quality matches AdamW |
+| Optimizer-step speed | baseline | ~2× faster `opt.step()`, identical results |
+| Peak memory during the step | large transient spikes | much lower peak — room for bigger models / batches |
+| Sharded multi-GPU training (FSDP2) | breaks with the fast path | works — for plain Gefen *and* Muon |
+| Whole-model Muon | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
+| Save / resume checkpoints | can corrupt state or lose tuning on resume | saves &amp; resumes correctly |
+| Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
+| Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
+| Getting started | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
+
+Measured numbers (Qwen3 0.6B / 1.7B) and the technical details are in [Benchmarks](#benchmarks) and the sections below.
+
+</details>
+
 Gefen is a drop-in replacement for the AdamW optimizer for memory-efficient
 training. It keeps the familiar AdamW training recipe while dramatically
 reducing optimizer-state memory: an 8x reduction in AdamW memory footprint, or
