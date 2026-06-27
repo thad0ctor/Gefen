@@ -94,7 +94,7 @@ print('Finished successfully.')
 ### Learning rate (when porting an AdamW config)
 
 Gefen matches AdamW's *interface*, but it needs a **lower learning rate** —
-about **0.6× AdamW's** on the architectures we tested (Qwen3, i.e. SwiGLU MLP +
+about **0.6× AdamW's** on the architectures tested (Qwen3, i.e. SwiGLU MLP +
 grouped-query attention). This factor is **model-specific**, not a universal
 constant — it is set by the model's RMSNorm/block structure (see below), so treat
 0.6× as a starting point for Qwen3-family decoders and measure it for anything
@@ -274,13 +274,6 @@ optimizer = GefenMuonHybrid(*split_params_for_muon(model), lr=training_args.lear
 trainer = Trainer(model=model, args=training_args, train_dataset=train_dataset,
                   optimizers=(optimizer, None))  # (optimizer, lr_scheduler)
 ```
-
-## Testimonials
-
-Have you tried Gefen and want to report your impressions privately or publicly?
-We would be happy to hear about your experience. With your permission, we can
-credit you and mention your work here.
-
 
 ## Citation
 
