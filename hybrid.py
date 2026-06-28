@@ -18,6 +18,23 @@ full matrix per step (GefenMuon._step_automatic), run the quantized-momentum +
 Newton-Schulz pipeline on the full matrix so the numerics match the single-GPU
 reference, then slice the orthogonalized update back to the local shard. Tensor
 parallelism / multi-dim (HSDP x TP) meshes are not validated.
+
+Recommended configuration (minimizes divergence vs AdamW at matched LR -- see the
+loss-recovery sweep; Qwen3-0.6B/1.7B, 300 steps): keep the Muon half at AdamW
+scale and lower only the backup half, plus per-element 2nd moment on the 1D
+backup tensors. Both are free on throughput::
+
+    opt = GefenMuonHybrid(
+        *split_params_for_muon(model),
+        lr=ADAMW_LR,                  # Muon (2D) half stays at AdamW scale
+        backup_lr=0.5 * ADAMW_LR,     # backup half ~0.4-0.6x (tune); the main lever
+        adjust_lr_fn="match_rms_adamw",
+        backup_1d_period_one=True,    # AdamW-like per-element 2nd moment on norms/biases
+    )
+
+This closed the eval-loss gap to AdamW (and beat it at 0.6B) while keeping ~1.0
+B/param optimizer state. Defaults below stay parity-preserving (period-1 off,
+shared lr), so set these explicitly to opt in.
 """
 from collections import OrderedDict
 
