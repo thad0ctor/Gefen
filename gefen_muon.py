@@ -13,39 +13,205 @@ DEFAULT_B = -4.7750
 DEFAULT_C = 2.0315
 DEFAULT_NS_STEPS = 5
 
+# Tuned per-iteration Newton-Schulz coefficient schedules. Each entry is a list
+# of (a, b, c) quintic coefficients applied one per iteration. Unlike the fixed
+# (DEFAULT_A, DEFAULT_B, DEFAULT_C) quintic -- which uses identical, conservative
+# coefficients for all ns_steps iterations -- these schedules deliberately
+# overshoot in the early iterations (large a, very negative b) to amplify the
+# small singular values fast, then refine, reaching the same orthogonality in
+# fewer iterations. Derived by minimax optimization of the K-fold composition of
+# p(s) = a s + b s^3 + c s^5 over s in [s_min, 1] (see
+# benchmarks/microbench/derive_ns_schedule.py). NS is GEMM-FLOP-bound on the
+# real Muon shapes, so K iterations cost ~K/5 of the standard 5-step NS.
+# 3-step (40% fewer iterations). Robust over s in [1e-2, 1] with peak|p| <= 1.15
+# (safe on near-low-rank gradients). Slightly below the standard 5-step on the
+# very smallest singular values (3 safe quintic steps cannot amplify s < ~1e-2
+# all the way to 1) -- a speed/quality trade, not a strict win.
+NS_SCHEDULE_3STEP = [
+    (5.0067, -14.4125, 10.6001),
+    (3.7534, -6.8083, 3.3840),
+    (3.2080, -4.3501, 2.0330),
+]
+# 4-step (20% fewer iterations). Robust over s in [1e-2, 1] with peak|p| <= 1.01
+# (very safe). Beats the standard 5-step orthogonality on the real Muon shapes.
+NS_SCHEDULE_4STEP = [
+    (5.4261, -15.5285, 11.2657),
+    (3.0766, -4.9701, 2.1297),
+    (3.0008, -6.4486, 4.3696),
+    (2.8386, -4.1421, 2.5758),
+]
+# Named schedules selectable via the GefenMuon ``ns_schedule`` group option.
+NS_SCHEDULES = {
+    "standard": None,  # use ns_coefficients/ns_steps as-is (classic quintic)
+    "tuned3": NS_SCHEDULE_3STEP,
+    "tuned4": NS_SCHEDULE_4STEP,
+}
 
-def _zeropower_via_newtonschulz(
-    grad: torch.Tensor,
-    ns_coefficients: Tuple[float, float, float],
-    ns_steps: int,
-    eps: float,
-) -> torch.Tensor:
+# fp8 (e4m3) Newton-Schulz support. e4m3 has a max representable magnitude of
+# 448; we per-row scale every operand into [-448, 448] before the fp8 GEMM and
+# undo the scale in the (bf16/fp32-accumulated) output via torch._scaled_mm.
+_FP8_DTYPE = torch.float8_e4m3fn
+_FP8_MAX = 448.0
+_FP8_MIN_SCALE = 1e-12
+# fp8 tensor-core GEMMs (the e4m3 path used here) need sm_89+ (Ada / Hopper /
+# Blackwell). Older GPUs (e.g. Ampere sm_80/86) have no fp8 GEMM.
+_FP8_MIN_CAPABILITY = (8, 9)
+_ns_fp8_compiled = None
 
+
+def _fp8_supported() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return torch.cuda.get_device_capability() >= _FP8_MIN_CAPABILITY
+    except Exception:
+        return False
+
+
+def _quantize_rowwise_fp8(x: torch.Tensor):
+    # Per-row absmax scaling into the e4m3 range. Returns (fp8 tensor, fp32
+    # scale [rows, 1]) such that fp8_value * scale ~= x.
+    scale = (x.abs().amax(dim=1, keepdim=True).float() / _FP8_MAX).clamp(
+        min=_FP8_MIN_SCALE
+    )
+    xq = (x.float() / scale).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE)
+    return xq, scale
+
+
+def _ns_fp8_core(ortho_grad: torch.Tensor, schedule) -> torch.Tensor:
+    # fp8 Newton-Schulz iteration. The three matmuls (Gram, Gram^2, the
+    # gram_update @ X update) run in e4m3 with bf16 accumulation via
+    # torch._scaled_mm; the lightweight elementwise combine stays in bf16.
+    # Newton-Schulz is iterative and self-correcting, so the per-matmul fp8
+    # rounding error largely washes out across iterations. `ortho_grad` is the
+    # already-normalized, already-oriented (rows <= cols) bf16 matrix. `schedule`
+    # is the resolved per-iteration list of (a, b, c) coefficients, so the fp8
+    # path benefits from the tuned schedules (tuned3/tuned4) exactly like bf16.
+    for a, b, c in schedule:
+        # gram = X @ X.T : both operands are X, so quantize X once. The B side
+        # (X.T) is the transpose view of the row-major fp8 X -- it is
+        # column-major (stride(0) == 1) and its per-column scale is X's per-row
+        # scale, exactly what _scaled_mm rowwise scaling wants.
+        xq, sx = _quantize_rowwise_fp8(ortho_grad)
+        gram = torch._scaled_mm(
+            xq, xq.T, scale_a=sx, scale_b=sx.T, out_dtype=torch.bfloat16
+        )
+        # gram is symmetric, so gram @ gram reuses a single quantization too.
+        gq, sg = _quantize_rowwise_fp8(gram)
+        gram_sq = torch._scaled_mm(
+            gq, gq.T, scale_a=sg, scale_b=sg.T, out_dtype=torch.bfloat16
+        )
+        gram_update = (b * gram + c * gram_sq).bfloat16()
+        # ortho_grad = a * X + gram_update @ X. gram_update is the row-major A
+        # operand; the B operand X must be column-major, which needs a separate
+        # column-wise quantization (== row-wise quantization of X.T).
+        guq, sgu = _quantize_rowwise_fp8(gram_update)
+        xt = ortho_grad.T.contiguous()
+        sxt = (xt.abs().amax(dim=1, keepdim=True).float() / _FP8_MAX).clamp(
+            min=_FP8_MIN_SCALE
+        )
+        x_colmajor = (xt.float() / sxt).clamp(-_FP8_MAX, _FP8_MAX).to(_FP8_DTYPE).T
+        gux = torch._scaled_mm(
+            guq, x_colmajor, scale_a=sgu, scale_b=sxt.T, out_dtype=torch.bfloat16
+        )
+        ortho_grad = (a * ortho_grad + gux).bfloat16()
+    return ortho_grad
+
+
+def _get_ns_fp8_core(compile_fp8: bool):
+    # The fp8 GEMM win only materializes once the per-matmul quantization
+    # (amax / scale / cast) is fused into the surrounding kernels, which
+    # torch.compile does. Eager fp8 is correctness-equivalent but slower than
+    # bf16 at Muon matrix sizes, so compilation is on by default.
+    global _ns_fp8_compiled
+    if not compile_fp8:
+        return _ns_fp8_core
+    if _ns_fp8_compiled is None:
+        _ns_fp8_compiled = torch.compile(
+            _ns_fp8_core, mode="max-autotune-no-cudagraphs", dynamic=False
+        )
+    return _ns_fp8_compiled
+
+
+def _normalize_ns_schedule(
+    ns_coefficients, ns_steps: int
+) -> "list[Tuple[float, float, float]]":
+    """Resolve ``ns_coefficients`` / ``ns_steps`` into a per-iteration schedule.
+
+    Accepts either form (backward compatible):
+      * a single ``(a, b, c)`` tuple -> the classic fixed quintic, repeated for
+        ``ns_steps`` iterations (identical behavior to the original helper);
+      * a sequence of ``(a, b, c)`` tuples -> an explicit per-iteration schedule
+        whose length IS the iteration count (``ns_steps`` is then ignored).
+    """
     if ns_steps >= 100:
         raise ValueError(
             "Number of steps must be less than 100 for computational efficiency"
         )
+    if len(ns_coefficients) == 0:
+        raise ValueError("ns_coefficients must be non-empty")
+
+    first = ns_coefficients[0]
+    is_single_tuple = isinstance(first, (int, float))
+    if is_single_tuple:
+        if len(ns_coefficients) != 3:
+            raise ValueError(
+                "A single coefficient set must be a tuple of exactly 3 values"
+            )
+        return [tuple(float(x) for x in ns_coefficients)] * int(ns_steps)
+
+    schedule = []
+    for entry in ns_coefficients:
+        if len(entry) != 3:
+            raise ValueError(
+                "Each Newton-Schulz schedule entry must have exactly 3 values"
+            )
+        schedule.append(tuple(float(x) for x in entry))
+    return schedule
+
+
+def _zeropower_via_newtonschulz(
+    grad: torch.Tensor,
+    ns_coefficients,
+    ns_steps: int,
+    eps: float,
+    use_fp8: bool = False,
+    compile_fp8: bool = True,
+) -> torch.Tensor:
+
     if len(grad.shape) != 2:
         raise ValueError("Input tensor gradient must be a 2D matrix")
-    if len(ns_coefficients) != 3:
-        raise ValueError("Coefficients must be a tuple of exactly 3 values")
 
-    a, b, c = ns_coefficients
+    # Resolve the (possibly tuned per-iteration) schedule. A single (a, b, c)
+    # tuple reproduces the classic fixed quintic bit-for-bit; an explicit
+    # sequence is the tuned poly path. Both compose with the fp8 NS path below.
+    schedule = _normalize_ns_schedule(ns_coefficients, ns_steps)
+
     ortho_grad = grad.bfloat16()
     if grad.size(0) > grad.size(1):
         ortho_grad = ortho_grad.T
 
-    ortho_grad.div_(ortho_grad.norm().clamp(min=eps))
-    for _ in range(ns_steps):
-        gram_matrix = ortho_grad @ ortho_grad.T
-        gram_update = torch.addmm(
-            gram_matrix,
-            gram_matrix,
-            gram_matrix,
-            beta=b,
-            alpha=c,
-        )
-        ortho_grad = torch.addmm(ortho_grad, gram_update, ortho_grad, beta=a)
+    ortho_grad = ortho_grad.div(ortho_grad.norm().clamp(min=eps))
+    if use_fp8:
+        if not _fp8_supported():
+            raise RuntimeError(
+                "fp8 Newton-Schulz (fp8_ns=True) requires a CUDA GPU with "
+                "compute capability >= 8.9 (Ada/Hopper/Blackwell); "
+                "torch._scaled_mm has no fp8 GEMM otherwise."
+            )
+        core = _get_ns_fp8_core(compile_fp8)
+        ortho_grad = core(ortho_grad.contiguous(), schedule)
+    else:
+        for a, b, c in schedule:
+            gram_matrix = ortho_grad @ ortho_grad.T
+            gram_update = torch.addmm(
+                gram_matrix,
+                gram_matrix,
+                gram_matrix,
+                beta=b,
+                alpha=c,
+            )
+            ortho_grad = torch.addmm(ortho_grad, gram_update, ortho_grad, beta=a)
 
     if grad.size(0) > grad.size(1):
         ortho_grad = ortho_grad.T
@@ -80,10 +246,13 @@ class GefenMuon(Gefen):
         ns_coefficients: Tuple[float, float, float] = (DEFAULT_A, DEFAULT_B, DEFAULT_C),
         eps: float = EPS,
         ns_steps: int = DEFAULT_NS_STEPS,
+        ns_schedule: Optional[object] = None,
         adjust_lr_fn: Optional[str] = None,
         *,
         fused: bool = True,
         sharded_mode: str = "exact",
+        fp8_ns: bool = False,
+        fp8_ns_compile: bool = True,
         verbose: bool = False,
     ) -> None:
         if isinstance(lr, torch.Tensor) and lr.numel() != 1:
@@ -108,6 +277,28 @@ class GefenMuon(Gefen):
                 "sharded_mode must be 'exact', 'approx' or 'distributed' but is: "
                 "{}".format(sharded_mode)
             )
+        # ns_schedule (optional): a tuned per-iteration Newton-Schulz coefficient
+        # schedule that reaches orthogonality in fewer iterations than the fixed
+        # quintic. Accepts a named schedule ("standard"/"tuned3"/"tuned4") or an
+        # explicit sequence of (a, b, c) tuples (one per iteration). When set it
+        # OVERRIDES ns_coefficients/ns_steps; the iteration count becomes the
+        # schedule length. None (default) keeps the classic fixed-quintic path.
+        if ns_schedule is not None:
+            if isinstance(ns_schedule, str):
+                if ns_schedule not in NS_SCHEDULES:
+                    raise ValueError(
+                        "Unknown ns_schedule {!r}; choose from {}".format(
+                            ns_schedule, sorted(NS_SCHEDULES)
+                        )
+                    )
+                resolved = NS_SCHEDULES[ns_schedule]
+            else:
+                resolved = ns_schedule
+            if resolved is not None:
+                # Validate eagerly so misconfigurations fail at construction.
+                schedule = _normalize_ns_schedule(resolved, ns_steps)
+                ns_coefficients = schedule
+                ns_steps = len(schedule)
         # "exact" (default): under FSDP2 every rank gathers the full gradient and
         # runs Newton-Schulz on the full matrix -> bit-for-bit single-GPU parity.
         # "approx": each rank runs the whole pipeline on its LOCAL shard only --
@@ -126,6 +317,20 @@ class GefenMuon(Gefen):
         # full-NS-everywhere path for non-1D meshes (e.g. HSDP x TP).
         self._sharded_mode = sharded_mode
 
+        # fp8 Newton-Schulz (opt-in). Default False keeps the bf16 NS path
+        # bit-for-bit unchanged. When True, the NS matmuls run in e4m3 with
+        # bf16 accumulation; this requires sm_89+ and is only faster than bf16
+        # once torch.compile fuses the quantization (fp8_ns_compile, default
+        # True). At small Muon shapes (min-dim <~ 1024) bf16 is still faster.
+        if fp8_ns and not _fp8_supported():
+            raise ValueError(
+                "fp8_ns=True requires a CUDA GPU with compute capability "
+                ">= 8.9 (Ada/Hopper/Blackwell); torch._scaled_mm has no fp8 "
+                "GEMM otherwise."
+            )
+        self._fp8_ns = fp8_ns
+        self._fp8_ns_compile = fp8_ns_compile
+
         super().__init__(
             params,
             lr=lr,
@@ -143,6 +348,8 @@ class GefenMuon(Gefen):
             group["ns_steps"] = ns_steps
             group["adjust_lr_fn"] = adjust_lr_fn
             group["sharded_mode"] = sharded_mode
+            group["fp8_ns"] = fp8_ns
+            group["fp8_ns_compile"] = fp8_ns_compile
             for p in group["params"]:
                 if p.ndim != 2:
                     raise ValueError(
@@ -403,6 +610,8 @@ class GefenMuon(Gefen):
             group["ns_coefficients"],
             group["ns_steps"],
             group["eps"],
+            use_fp8=group.get("fp8_ns", False),
+            compile_fp8=group.get("fp8_ns_compile", True),
         )
 
     def _apply_muon_update(

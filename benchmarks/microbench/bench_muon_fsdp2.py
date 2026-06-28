@@ -50,6 +50,7 @@ from gefen.gefen_muon import (  # noqa: E402
     DEFAULT_A,
     DEFAULT_B,
     DEFAULT_C,
+    NS_SCHEDULES,
 )
 
 LR = 5e-3
@@ -102,7 +103,29 @@ def main():
                     choices=["exact", "approx", "distributed"],
                     help="sharded_mode (overrides --approx if set)")
     ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--ns-schedule", default="standard",
+                    choices=sorted(NS_SCHEDULES),
+                    help="Newton-Schulz coefficient schedule "
+                         "(standard/tuned3/tuned4)")
+    ap.add_argument("--fp8", type=int, default=0,
+                    help="run the NS matmuls in fp8 e4m3 (sm_89+ only)")
+    ap.add_argument("--fp8-compile", type=int, default=1,
+                    help="torch.compile the fp8 NS core (needed for the win)")
     args = ap.parse_args()
+
+    # Resolve the schedule used by BOTH the optimizer and the NS-only breakdown
+    # timer so the decomposition reflects the configured lever. A string ->
+    # GefenMuon resolves it; the explicit list (or single tuple) is what the
+    # standalone _zeropower_via_newtonschulz timer needs.
+    sched_resolved = NS_SCHEDULES[args.ns_schedule]
+    if sched_resolved is None:
+        ns_coeffs_for_timer = (DEFAULT_A, DEFAULT_B, DEFAULT_C)
+        ns_steps_for_timer = args.ns_steps
+    else:
+        ns_coeffs_for_timer = sched_resolved
+        ns_steps_for_timer = len(sched_resolved)
+    ns_schedule_kw = None if args.ns_schedule == "standard" else args.ns_schedule
+    fp8_kw = dict(fp8_ns=bool(args.fp8), fp8_ns_compile=bool(args.fp8_compile))
 
     # Resolve the sharded mode (new --mode wins; --approx kept for back-compat).
     mode = args.mode if args.mode is not None else (
@@ -127,7 +150,9 @@ def main():
     if rank == 0:
         print(f"=== {torch.cuda.get_device_name(0)} x{world}  "
               f"fused={bool(args.fused)} mode={mode} "
-              f"dtype={args.dtype} ns_steps={args.ns_steps} ===")
+              f"dtype={args.dtype} ns_steps={ns_steps_for_timer} "
+              f"ns_schedule={args.ns_schedule} fp8={bool(args.fp8)}"
+              f"{'(compiled)' if args.fp8 and args.fp8_compile else ''} ===")
         print(f"shapes: {len(shapes)} matrices, {n_params/1e6:.1f}M params "
               f"(hidden={args.hidden} inter={args.inter} layers={args.layers})")
 
@@ -147,7 +172,7 @@ def main():
 
     kwargs = dict(lr=LR, ns_steps=args.ns_steps, fused=bool(args.fused),
                   weight_decay=WD, adjust_lr_fn="match_rms_adamw",
-                  sharded_mode=mode)
+                  sharded_mode=mode, ns_schedule=ns_schedule_kw, **fp8_kw)
     opt = GefenMuon(params, **kwargs)
 
     def set_grads():
@@ -189,7 +214,8 @@ def main():
         def ns_only():
             for x in ns_inputs:
                 _zeropower_via_newtonschulz(
-                    x, (DEFAULT_A, DEFAULT_B, DEFAULT_C), args.ns_steps, 1e-7)
+                    x, ns_coeffs_for_timer, ns_steps_for_timer, 1e-7,
+                    use_fp8=bool(args.fp8), compile_fp8=bool(args.fp8_compile))
         ns_ms = cuda_time(ns_only, args.iters, args.warmup)
 
         if mode == "distributed":
@@ -201,7 +227,9 @@ def main():
             def ns_owned():
                 for x in owned:
                     _zeropower_via_newtonschulz(
-                        x, (DEFAULT_A, DEFAULT_B, DEFAULT_C), args.ns_steps, 1e-7)
+                        x, ns_coeffs_for_timer, ns_steps_for_timer, 1e-7,
+                        use_fp8=bool(args.fp8),
+                        compile_fp8=bool(args.fp8_compile))
             ns_owned_ms = cuda_time(ns_owned, args.iters, args.warmup)
 
             # broadcast-only: the ADDED comm -- every update broadcast from its
@@ -251,7 +279,7 @@ def main():
     named = [(f"L{i}", p) for i, p in enumerate(sharded)]
     kwargs2 = dict(lr=LR, ns_steps=args.ns_steps, fused=bool(args.fused),
                    weight_decay=WD, adjust_lr_fn="match_rms_adamw",
-                   sharded_mode=mode)
+                   sharded_mode=mode, ns_schedule=ns_schedule_kw, **fp8_kw)
     opt2 = GefenMuon(named, **kwargs2)
     nsteps = 3
     for _ in range(nsteps):
@@ -273,7 +301,8 @@ def main():
         named_ref = [(f"L{i}", refs[i]) for i in range(len(shapes))]
         opt_ref = GefenMuon(named_ref, lr=LR, ns_steps=args.ns_steps,
                             fused=bool(args.fused), weight_decay=WD,
-                            adjust_lr_fn="match_rms_adamw")
+                            adjust_lr_fn="match_rms_adamw",
+                            ns_schedule=ns_schedule_kw, **fp8_kw)
         for _ in range(nsteps):
             for i, pr in enumerate(refs):
                 pr.grad = p_grads[i].clone()

@@ -386,7 +386,7 @@ def _dist_shapes(world):
     return [(64, 96), (48, 64), (65, 96), (1, 8), (2, 12)]
 
 
-def _worker_distributed(rank, world, port, q):
+def _worker_distributed(rank, world, port, q, ns_schedule=None):
     import os as _os
     import sys as _sys
 
@@ -438,7 +438,12 @@ def _worker_distributed(rank, world, port, q):
                     )
                 )
             opt = GefenMuon(
-                params, lr=LR, fused=True, weight_decay=WD, sharded_mode=mode
+                params,
+                lr=LR,
+                fused=True,
+                weight_decay=WD,
+                sharded_mode=mode,
+                ns_schedule=ns_schedule,
             )
             return params, opt
 
@@ -471,7 +476,11 @@ def _worker_distributed(rank, world, port, q):
                 (f"w{i}", nn.Parameter(init.clone())) for i, init in enumerate(inits)
             ]
             ref_opt = GefenMuon(
-                ref_params, lr=LR, fused=True, weight_decay=WD
+                ref_params,
+                lr=LR,
+                fused=True,
+                weight_decay=WD,
+                ns_schedule=ns_schedule,
             )
             for step in range(DIST_STEPS):
                 grads = make_grads(step)
@@ -502,14 +511,16 @@ def _worker_distributed(rank, world, port, q):
             dist.destroy_process_group()
 
 
-def _run_distributed_case(world):
+def _run_distributed_case(world, ns_schedule=None):
     import torch.multiprocessing as mp
 
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = _get_free_port()
     procs = [
-        ctx.Process(target=_worker_distributed, args=(r, world, port, q))
+        ctx.Process(
+            target=_worker_distributed, args=(r, world, port, q, ns_schedule)
+        )
         for r in range(world)
     ]
     for pr in procs:
@@ -552,8 +563,9 @@ def _run_distributed_case(world):
         and (max_vs_exact <= DIST_EXACT_TOL)
         and empty_owner_ok
     )
+    sched_label = ns_schedule if ns_schedule is not None else "standard"
     print(
-        f"[dist x{world}] changed={changed} finite={finite} "
+        f"[dist x{world} sched={sched_label}] changed={changed} finite={finite} "
         f"max|dist-oracle|={max_vs_oracle:.3e} max|dist-exact|={max_vs_exact:.3e} "
         f"empty_owner(rank{empty_owner_rank})={'n/a' if empty_owner_rank==0 else owner_empty.get(empty_owner_rank)} "
         f"{'PASS' if ok else 'FAIL'}"
@@ -573,8 +585,13 @@ def run():
             for c in FUSED_CASES:
                 results[f"fused_multirank_{c}"] = _run_fused_cuda_case(c)
             results["distributed_x2"] = _run_distributed_case(2)
+            # Combined-lever coverage: distributed mode WITH the tuned4 schedule
+            # must still be bit-identical to exact mode (also tuned4) and within
+            # tol of the single-GPU tuned4 oracle.
+            results["distributed_x2_tuned4"] = _run_distributed_case(2, "tuned4")
         if torch.cuda.device_count() >= 4:
             results["distributed_x4"] = _run_distributed_case(4)
+            results["distributed_x4_tuned4"] = _run_distributed_case(4, "tuned4")
     return all(results.values())
 
 
@@ -614,8 +631,9 @@ if pytest is not None:
     @pytest.mark.parametrize(
         "world", [2] + ([4] if torch.cuda.device_count() >= 4 else [])
     )
-    def test_muon_fsdp2_distributed_parity(world):
-        assert _run_distributed_case(world)
+    @pytest.mark.parametrize("ns_schedule", [None, "tuned4"])
+    def test_muon_fsdp2_distributed_parity(world, ns_schedule):
+        assert _run_distributed_case(world, ns_schedule)
 
 
 if __name__ == "__main__":
