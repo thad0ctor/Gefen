@@ -123,11 +123,31 @@ def test_reexec_planner():
     print("D. re-exec planner (venv/python/cuda-home, strip, child-guard) PASS")
 
 
+def test_distribute_lrs():
+    from gefen.tools.find_lr import distribute_lrs
+    grid = [1e-5, 3e-5, 1e-4, 3e-4, 1e-3]
+    # Round-robin across 3 devices: even spread, every LR placed exactly once.
+    a = distribute_lrs(grid, ["cuda:0", "cuda:1", "cuda:2"])
+    assert a == {"cuda:0": [1e-5, 3e-4], "cuda:1": [3e-5, 1e-3], "cuda:2": [1e-4]}
+    placed = [lr for ls in a.values() for lr in ls]
+    assert sorted(placed) == sorted(grid)
+    # More GPUs than LRs -> empty devices dropped (no idle worker spawned).
+    a2 = distribute_lrs([1e-5, 3e-5], ["cuda:0", "cuda:1", "cuda:2"])
+    assert a2 == {"cuda:0": [1e-5], "cuda:1": [3e-5]}
+    # Single device gets the whole grid (== sequential path coverage).
+    assert distribute_lrs(grid, ["cuda:0"]) == {"cuda:0": grid}
+    # Balanced sizes: counts differ by at most 1.
+    sizes = [len(v) for v in distribute_lrs(grid, ["a", "b"]).values()]
+    assert max(sizes) - min(sizes) <= 1
+    print("E. distribute_lrs round-robin (even, complete, drops empty) PASS")
+
+
 def run():
     test_build_optimizer_all_families()
     test_range_test_each_family_and_restore()
     test_restore_false_mutates()
     test_reexec_planner()
+    test_distribute_lrs()
     print("\nAll find_lr smoke checks passed.")
 
 

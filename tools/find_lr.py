@@ -268,6 +268,159 @@ def _short_finetune(model, train_blocks, optimizer, device, *, steps, warmup, bs
 
 
 # --------------------------------------------------------------------------- #
+# Parallel multi-GPU sweep (each LR arm is independent -> fan across GPUs)
+# --------------------------------------------------------------------------- #
+def distribute_lrs(lrs: List[float], devices: List[str]) -> Dict[str, List[float]]:
+    """Round-robin assign LR arms to devices (pure / unit-testable). Device i gets
+    ``lrs[i], lrs[i+len(devices)], ...`` so the grid is spread as evenly as
+    possible and the same selection is reproducible regardless of #GPUs."""
+    if not devices:
+        raise ValueError("no devices given")
+    assignment: Dict[str, List[float]] = {d: [] for d in devices}
+    for i, lr in enumerate(lrs):
+        assignment[devices[i % len(devices)]].append(lr)
+    # Drop devices that got no LRs (more GPUs than grid points).
+    return {d: ls for d, ls in assignment.items() if ls}
+
+
+def _prewarm_kernels():
+    """Trigger the (cached) CUDA kernel build once in the parent so concurrent
+    spawn workers load the compiled .so instead of all racing to compile it."""
+    try:
+        import gefen.gefen  # noqa: F401  -- import builds/loads the fused kernels
+    except Exception:
+        pass  # best-effort; torch's extension lock makes concurrent builds safe too
+
+
+def _sweep_worker(device: str, lr_list: List[float], cfg: dict, q) -> None:
+    """Spawned worker: load the model FROM PATH on ``device`` (the in-memory model
+    can't cross processes), run a short fine-tune + held-out eval at each assigned
+    LR, and push ``("RESULT", lr, eval)`` per LR, then ``("DONE", device, None)``.
+    Any exception is reported as ``("ERROR", device, traceback)`` so the parent
+    never hangs on a dead worker."""
+    import traceback
+    import types
+
+    try:
+        import torch as _torch
+        from gefen.tools.run_model_calibration import load_model
+
+        dtype = getattr(_torch, cfg["dtype"])
+        tok, model = load_model(cfg["model_path"], device, dtype)
+        ds_args = types.SimpleNamespace(
+            seq=cfg["seq"], dataset=cfg["dataset"], split=cfg["split"],
+            max_rows=cfg["max_rows"], eval_blocks=cfg["eval_blocks"],
+        )
+        train_blocks, eval_blocks = build_token_stream(tok, ds_args)
+        snap = _snapshot(model)
+        for lr in lr_list:
+            model.load_state_dict(snap)
+            opt = build_optimizer(
+                model, cfg["optimizer"], lr, weight_decay=cfg["weight_decay"],
+                fused=cfg["fused"], adjust_lr_fn=cfg["adjust_lr_fn"],
+            )
+            _short_finetune(model, train_blocks, opt, device,
+                            steps=cfg["sweep_steps"], warmup=cfg["warmup"],
+                            bs=cfg["bs"], seed=cfg["seed"])
+            ev = _eval_loss(model, eval_blocks, device, cfg["bs"])
+            print(f"[find_lr] lr {lr:.2e} on {device} -> eval {ev:.4f}", flush=True)
+            q.put(("RESULT", lr, ev))
+            del opt
+            _torch.cuda.empty_cache()
+        q.put(("DONE", device, None))
+    except Exception:  # noqa: BLE001 -- surface to the parent, don't hang
+        q.put(("ERROR", device, traceback.format_exc()))
+
+
+def find_lr_parallel_sweep(
+    model_path: str,
+    devices: List[str],
+    *,
+    optimizer: str = "gefen",
+    sweep_lrs: Optional[List[float]] = None,
+    dtype: str = "bfloat16",
+    dataset: str = "tatsu-lab/alpaca",
+    split: str = "train",
+    seq: int = 512,
+    max_rows: int = 0,
+    eval_blocks: int = 48,
+    weight_decay: float = 0.0,
+    fused: bool = True,
+    adjust_lr_fn: str = "match_rms_adamw",
+    sweep_steps: int = 80,
+    warmup: int = 10,
+    bs: int = 8,
+    seed: int = 0,
+    verbose: bool = True,
+    worker_timeout: float = 3600.0,
+) -> FindLRResult:
+    """CLI-level parallel ``method="sweep"``: fan the LR grid across ``devices``
+    (one spawn worker per device, each loading the model from ``model_path`` on its
+    GPU). Selection is identical to the sequential path (lowest held-out eval).
+
+    Single device -> just delegates to the sequential in-process path.
+    """
+    import torch.multiprocessing as mp
+
+    grid = list(sweep_lrs or [1e-5, 3e-5, 1e-4, 3e-4, 1e-3])
+    assignment = distribute_lrs(grid, list(devices))
+    cfg = dict(
+        model_path=model_path, dtype=dtype, optimizer=optimizer,
+        weight_decay=weight_decay, fused=fused, adjust_lr_fn=adjust_lr_fn,
+        dataset=dataset, split=split, seq=seq, max_rows=max_rows,
+        eval_blocks=eval_blocks, sweep_steps=sweep_steps, warmup=warmup,
+        bs=bs, seed=seed,
+    )
+
+    _prewarm_kernels()
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    procs = []
+    for dev, lrs in assignment.items():
+        p = ctx.Process(target=_sweep_worker, args=(dev, lrs, cfg, q))
+        p.start()
+        procs.append(p)
+        if verbose:
+            print(f"[find_lr] device {dev} <- LRs {['%.1e' % x for x in lrs]}", flush=True)
+
+    import queue as _pyqueue
+    results: Dict[float, float] = {}
+    errors: List = []
+    done = 0
+    while done < len(procs):
+        try:
+            tag, a, b = q.get(timeout=worker_timeout)
+        except _pyqueue.Empty:
+            if not any(p.is_alive() for p in procs):
+                break  # all workers died without signalling -> stop waiting
+            continue
+        if tag == "RESULT":
+            results[a] = b
+        elif tag == "DONE":
+            done += 1
+        elif tag == "ERROR":
+            errors.append((a, b))
+            done += 1
+    for p in procs:
+        p.join(timeout=15)
+        if p.is_alive():
+            p.terminate()
+
+    if errors:
+        dev, tb = errors[0]
+        raise RuntimeError(f"parallel sweep worker on {dev} failed:\n{tb}")
+    missing = [lr for lr in grid if lr not in results]
+    if missing:
+        raise RuntimeError(f"parallel sweep produced no result for LRs {missing}")
+
+    best = min(results, key=results.get)
+    out = FindLRResult(lr=best, optimizer=optimizer, method="sweep", sweep=results)
+    if verbose:
+        print(out.summary())
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Dataset -> packed token blocks (self-contained; HF name OR local file)
 # --------------------------------------------------------------------------- #
 def _row_text(r):
@@ -402,6 +555,11 @@ def main():
     ap.add_argument("--dataset", default="tatsu-lab/alpaca")
     ap.add_argument("--split", default="train")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument(
+        "--devices", nargs="+", default=None,
+        help="multiple devices for a PARALLEL sweep (e.g. --devices cuda:0 cuda:1); "
+        "each LR arm runs on its own GPU. Only used for --method sweep with >1 device.",
+    )
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--seq", type=int, default=512)
     ap.add_argument("--bs", type=int, default=8)
@@ -423,12 +581,27 @@ def main():
     # importing gefen (kernel build). No-op when already in the right env.
     _maybe_reexec(args)
 
+    devices = args.devices or [args.device]
+
+    # Parallel sweep: fan the LR grid across GPUs (loads the model per worker from
+    # --model, so this is CLI-level, not the in-memory find_lr path).
+    if args.method == "sweep" and len(devices) > 1:
+        res = find_lr_parallel_sweep(
+            args.model, devices, optimizer=args.optimizer, sweep_lrs=args.sweep_lrs,
+            dtype=args.dtype, dataset=args.dataset, split=args.split, seq=args.seq,
+            max_rows=args.max_rows, eval_blocks=args.eval_blocks,
+            weight_decay=args.weight_decay, sweep_steps=args.sweep_steps,
+            warmup=args.warmup, bs=args.bs, seed=args.seed,
+        )
+        print(f"\nRECOMMENDED base LR for {args.optimizer}: {res.lr:.3e}")
+        return
+
     from gefen.tools.run_model_calibration import load_model
-    tok, model = load_model(args.model, args.device, getattr(torch, args.dtype))
+    tok, model = load_model(args.model, devices[0], getattr(torch, args.dtype))
     train_blocks, eval_blocks = build_token_stream(tok, args)
     res = find_lr(
         model, train_blocks, optimizer=args.optimizer, method=args.method,
-        eval_blocks=eval_blocks, device=args.device, weight_decay=args.weight_decay,
+        eval_blocks=eval_blocks, device=devices[0], weight_decay=args.weight_decay,
         num_iter=args.num_iter, start_lr=args.start_lr, end_lr=args.end_lr,
         sweep_lrs=args.sweep_lrs, sweep_steps=args.sweep_steps, warmup=args.warmup,
         bs=args.bs, seed=args.seed,
