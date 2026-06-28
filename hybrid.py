@@ -35,6 +35,8 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         backup_named_params,
         *,
         lr,
+        muon_lr=None,
+        backup_lr=None,
         weight_decay=0.0,
         betas=(0.9, 0.999),
         eps=1e-8,
@@ -56,10 +58,21 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         # split_params_for_muon's callers, not here.
         validate_split(muon_named_params, backup_named_params)
 
+        # Per-half learning rates. The shared ``lr`` keeps the documented
+        # single-LR behavior; ``muon_lr`` / ``backup_lr`` override it per half so
+        # the Muon matrices (with ``adjust_lr_fn`` rescaling them to AdamW-RMS)
+        # and the backup-Gefen norms/embeddings/head can be tuned independently.
+        # NOTE: an LR scheduler that overwrites every group to one absolute value
+        # collapses the split; a multiplicative scheduler (the common case)
+        # preserves the muon/backup ratio because each sub-optimizer's groups
+        # carry their own lr.
+        muon_lr = lr if muon_lr is None else muon_lr
+        backup_lr = lr if backup_lr is None else backup_lr
+
         self.muon = (
             GefenMuon(
                 muon_named_params,
-                lr=lr,
+                lr=muon_lr,
                 weight_decay=weight_decay,
                 momentum=momentum,
                 nesterov=nesterov,
@@ -75,7 +88,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         self.backup = (
             Gefen(
                 backup_named_params,
-                lr=lr,
+                lr=backup_lr,
                 betas=betas,
                 eps=eps,
                 weight_decay=weight_decay,
