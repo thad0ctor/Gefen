@@ -342,7 +342,7 @@ Qwen3-0.6B, FSDP2, Alpaca, 2000 steps, lr `5e-5` (data replicated so the only va
 ![Gefen-Muon exact vs approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
 ![Gefen-Muon exact vs approx sharded — step time & VRAM](docs/benchmarks/muon_shard_perf.png)
 
-`approx` runs ~**1.3–1.7× faster**/step for **+0.036** eval loss at 2 shards and **+0.076** at 4 — the gap roughly doubles 2→4 shards, so treat it as an opt-in speed lever, not a default. For exact numerics without the per-step gather, instead **replicate** the Muon matrices under FSDP (a wrapping choice, not a flag).
+`approx` runs ~**1.3× faster**/step for **+0.033** eval loss at 2 shards and **+0.067** at 4 — the gap roughly doubles 2→4 shards, so treat it as an opt-in speed lever, not a default. For exact numerics without the per-step gather, instead **replicate** the Muon matrices under FSDP (a wrapping choice, not a flag).
 
 ## Citation:
 
