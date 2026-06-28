@@ -290,6 +290,8 @@ learning_rate: 6.0e-6    # ≈ 0.6× the AdamW LR you'd use — Gefen needs a lo
 weight_decay: 0.0
 ```
 
+`6.0e-6` here is the `≈0.6×` *fallback heuristic*; to set it properly for your model, run the LR finder (`python -m gefen.tools.find_lr --model <path> --optimizer gefen --method sweep`) — see [`tools/README.md`](tools/README.md).
+
 **Fused kernels** (recommended — ~2× faster `opt.step`, bit-exact, requires CUDA):
 
 ```yaml
@@ -307,7 +309,7 @@ optim_args:
 |---|---|---|
 | Select Gefen | `optimizer: gefen` | added by PR #3755 |
 | Fused kernels | `optim_args: { fused: true }` | ~2× faster `opt.step`; bit-exact |
-| Learning rate | `learning_rate: <≈0.6× AdamW>` | Gefen over-steps at AdamW's LR on SwiGLU/GQA (Qwen3) — see [Learning rate](#learning-rate-when-porting-an-adamw-config) |
+| Learning rate | `learning_rate: <≈0.6× AdamW>` | `≈0.6×` is a fallback heuristic — better, find it empirically with the LR finder (`python -m gefen.tools.find_lr …`, see [`tools/README.md`](tools/README.md)). Background: [Learning rate](#learning-rate-when-porting-an-adamw-config) |
 | Betas / eps / weight decay | standard `adam_beta1/2`, `adam_epsilon`, `weight_decay` | forwarded to Gefen |
 | `period==1` memory fallback | *on by default in this fork* | restores ~1 B/param on modern decoders; it's the module flag `MEMORY_SAFE_FALLBACK`, not a YAML key |
 
