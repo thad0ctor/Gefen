@@ -262,11 +262,69 @@ def _short_finetune(model, train_blocks, optimizer, device, *, steps, warmup, bs
 
 
 # --------------------------------------------------------------------------- #
+# Dataset -> packed token blocks (self-contained; HF name OR local file)
+# --------------------------------------------------------------------------- #
+def _row_text(r):
+    """Best-effort text extraction from a dataset row (str / common fields /
+    alpaca-style instruction+input+output)."""
+    if isinstance(r, str):
+        return r
+    if isinstance(r, dict):
+        if r.get("instruction"):
+            parts = [r.get("instruction", ""), r.get("input", ""), r.get("output", "")]
+            return "\n".join(p for p in parts if p)
+        for k in ("text", "content", "output", "completion", "body"):
+            if r.get(k):
+                return r[k]
+    return ""
+
+
+def _load_texts(dataset, split, max_rows):
+    """Load a list of text strings from a local file (.txt/.json/.jsonl) or, if
+    ``dataset`` isn't a path, an installed HuggingFace dataset by name."""
+    import os, json
+    if os.path.exists(dataset):
+        if dataset.endswith(".jsonl"):
+            rows = [json.loads(l) for l in open(dataset) if l.strip()]
+            texts = [_row_text(r) for r in rows]
+        elif dataset.endswith(".json"):
+            texts = [_row_text(r) for r in json.load(open(dataset))]
+        else:  # plain text file
+            texts = [open(dataset).read()]
+    else:
+        from datasets import load_dataset
+        texts = [_row_text(r) for r in load_dataset(dataset, split=split)]
+    texts = [t for t in texts if t]
+    if max_rows and max_rows > 0:
+        texts = texts[:max_rows]
+    return texts
+
+
+def build_token_stream(tok, args):
+    """Tokenize ``args.dataset`` and pack into ``[N, args.seq]`` blocks; hold out
+    the last ``args.eval_blocks`` for eval. Returns (train_blocks, eval_blocks)."""
+    seq = args.seq
+    eos = tok.eos_token_id if tok.eos_token_id is not None else 0
+    ids: List[int] = []
+    for t in _load_texts(args.dataset, args.split, args.max_rows):
+        ids.extend(tok(t, add_special_tokens=False)["input_ids"])
+        ids.append(eos)
+    n_blocks = len(ids) // seq
+    if n_blocks < 2:
+        raise ValueError(
+            f"only {len(ids)} tokens -> {n_blocks} blocks at seq={seq}; need >=2. "
+            f"Use a bigger --dataset, smaller --seq, or raise --max-rows."
+        )
+    blocks = torch.tensor(ids[: n_blocks * seq], dtype=torch.long).view(n_blocks, seq)
+    n_eval = max(1, min(args.eval_blocks, n_blocks // 5))
+    return blocks[:-n_eval], blocks[-n_eval:]
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 def main():
     from gefen.tools.run_model_calibration import load_model
-    from gefen.tools.train_real_validation import build_token_stream
 
     ap = argparse.ArgumentParser(description="Auto-find a base LR for a Gefen-family optimizer.")
     ap.add_argument("--model", required=True)

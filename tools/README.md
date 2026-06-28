@@ -25,6 +25,23 @@ Two modes:
 - **Plain `Gefen`** wants a **low, roughly model-independent LR ≈ 1e-5**, i.e. **~0.1–0.4× your AdamW LR** (lower). The static "≈0.6–0.8×" head-dim heuristic overestimates this and varies by model — prefer the finder.
 - **`GefenMuonHybrid`** roughly **reuses your AdamW LR** (~1×), with `adjust_lr_fn="match_rms_adamw"`.
 
+## Running it (env, dataset, GPUs)
+
+Worked example:
+```bash
+python -m gefen.tools.find_lr \
+    --model /path/to/Qwen3-1.7B \
+    --optimizer gefen --method sweep \
+    --dataset tatsu-lab/alpaca \      # HF dataset name, OR a local .txt/.json/.jsonl
+    --device cuda:0 --seq 512 --bs 8 \
+    --sweep-lrs 1e-5 3e-5 1e-4 3e-4
+# -> RECOMMENDED base LR for gefen: <number>
+```
+
+- **Environment.** The fork must be importable (`pip install -e .` of this repo). The default `fused=True` uses Gefen's CUDA kernels, which **require a CUDA toolkit whose `nvcc` matches `torch.version.cuda`** (the kernel build guard enforces this) — see the repo's CUDA build notes. If you don't have a matching toolkit, run with `fused=False` (programmatic) — pure-torch, no kernel build, just slower.
+- **Dataset.** `--dataset` accepts an installed/cached **HuggingFace dataset name** *or* a path to a local **`.txt` / `.json` / `.jsonl`** file (alpaca-style `instruction/input/output`, or a `text`/`content` field, are auto-detected). Offline machines should use a local file or a pre-cached dataset. The programmatic API takes a `[N, seq]` token tensor directly if you'd rather tokenize yourself.
+- **GPUs — single-GPU only (by design).** The finder runs in one process on one device; it does **not** shard across GPUs (no FSDP2/DDP), and `GefenMuonHybrid` is single-GPU/DDP-only regardless. For a model too large for one GPU: the good LR is largely **scale-transferable** (Gefen's factor is set by `head_dim`/norm-block structure, not parameter count — it holds across a model family; see the main README's LR section), so **find the LR on a size that fits one GPU (or a smaller same-`head_dim` proxy) and reuse it for the sharded run.** True sharded LR-finding is not implemented.
+
 ## Diagnostic probes
 
 | entry point | what it measures |
