@@ -41,6 +41,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
         muon_weight_decay=None,
         backup_weight_decay=None,
         no_decay_substrings=(),
+        backup_1d_period_one=False,
         betas=(0.9, 0.999),
         eps=1e-8,
         fused=True,
@@ -156,6 +157,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
             ]
             self.backup = Gefen(backup_groups, lr=backup_lr, betas=betas, eps=eps,
                                  weight_decay=backup_weight_decay, fused=fused,
+                                 force_1d_period_one=backup_1d_period_one,
                                  verbose=verbose)
         else:
             self.backup = (
@@ -166,6 +168,7 @@ class GefenMuonHybrid(torch.optim.Optimizer):
                     eps=eps,
                     weight_decay=backup_weight_decay,
                     fused=fused,
+                    force_1d_period_one=backup_1d_period_one,
                     verbose=verbose,
                 )
                 if backup_named_params
