@@ -41,6 +41,7 @@ FSDP2/DTensor, since it reads ``.to_local()`` shards.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
@@ -98,6 +99,39 @@ def _rms(t: torch.Tensor) -> float:
     if t.numel() == 0:
         return float("nan")
     return float(t.detach().float().pow(2).mean().sqrt().item())
+
+
+# --------------------------------------------------------------------------- #
+# Non-destructive probing: snapshot + restore params AND optimizer state
+# --------------------------------------------------------------------------- #
+# These probes call ``optimizer.step()`` to MEASURE the real update, which would
+# otherwise advance the model's weights and the optimizer's state (step counters,
+# 8-bit momentum codebooks, vmean, the learned codebook, the global step). To keep
+# the documented "safe to run against a live training job" contract, we snapshot
+# the params (to CPU, to bound GPU memory) and a deep copy of the optimizer's
+# state_dict before the probe and restore both in a ``finally``.
+def _snapshot_for_probe(optimizer):
+    seen = set()
+    param_backup = []
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if id(p) in seen:
+                continue
+            seen.add(id(p))
+            param_backup.append((p, _local(p).detach().to("cpu", copy=True)))
+    # deepcopy because Optimizer.state_dict() returns references to the live state
+    # tensors, not copies -- without this the "snapshot" would track the mutation.
+    opt_state = copy.deepcopy(optimizer.state_dict())
+    return param_backup, opt_state
+
+
+def _restore_from_probe(optimizer, snapshot) -> None:
+    param_backup, opt_state = snapshot
+    with torch.no_grad():
+        for p, cpu in param_backup:
+            local = _local(p)
+            local.copy_(cpu.to(local.device))
+    optimizer.load_state_dict(opt_state)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +231,10 @@ def measure_update_rms(
 
     groups = optimizer.param_groups
 
+    # Non-destructive: snapshot params + optimizer state so the probe leaves the
+    # live training job exactly as it found it (restored in the finally below).
+    probe_snapshot = _snapshot_for_probe(optimizer)
+
     # Snapshot and optionally neutralize weight decay.
     saved_wd = [g.get("weight_decay", 0.0) for g in groups]
     if zero_weight_decay:
@@ -248,6 +286,8 @@ def measure_update_rms(
         for g, wd in zip(groups, saved_wd):
             if "weight_decay" in g:
                 g["weight_decay"] = wd
+        # Revert all weight + optimizer-state mutation from the probe steps.
+        _restore_from_probe(optimizer, probe_snapshot)
 
     stats: List[GroupUpdateStats] = []
     for gi, g in enumerate(groups):
@@ -466,18 +506,27 @@ def calibrate_vs_adamw(
     """
     b1, b2 = betas
     groups = optimizer.param_groups
+    # Non-destructive: snapshot params + optimizer state, restored in the finally.
+    probe_snapshot = _snapshot_for_probe(optimizer)
     saved_wd = [g.get("weight_decay", 0.0) for g in groups]
     for g in groups:
         if "weight_decay" in g:
             g["weight_decay"] = 0.0
 
-    metas = []  # (p, group, analytic_ratios, group_lr)
+    metas = []  # (p, group, analytic_ratios, group_lr, param_name)
     for g in groups:
         ar = _analytic_ratios(g)
         lr = g["lr"]
         lr = float(lr.item() if isinstance(lr, torch.Tensor) else lr)
-        for p in g["params"]:
-            metas.append((p, g, ar, lr))
+        g_params = g["params"]
+        base = g.get("name", "?")
+        # Key each record by the PARAM, not just the group: the Gefen family puts
+        # one param per group (so base == the named_parameters() name), but a
+        # generic optimizer may group many tensors -- disambiguate those with an
+        # index so distinct tensors don't collapse into one per-type bucket.
+        for idx, p in enumerate(g_params):
+            pname = base if len(g_params) == 1 else f"{base}.{idx}"
+            metas.append((p, g, ar, lr, pname))
 
     m: Dict[int, torch.Tensor] = {}
     v: Dict[int, torch.Tensor] = {}
@@ -493,7 +542,7 @@ def calibrate_vs_adamw(
             t += 1
 
             before: Dict[int, torch.Tensor] = {}
-            for p, g, ar, lr in metas:
+            for p, g, ar, lr, _pname in metas:
                 if p.grad is None:
                     continue
                 grad = _local(p.grad).detach().float()
@@ -516,7 +565,7 @@ def calibrate_vs_adamw(
             optimizer.step()
             if step < warmup:
                 continue
-            for p, g, ar, lr in metas:
+            for p, g, ar, lr, _pname in metas:
                 key = id(p)
                 if key not in before:
                     continue
@@ -526,9 +575,11 @@ def calibrate_vs_adamw(
         for g, wd in zip(groups, saved_wd):
             if "weight_decay" in g:
                 g["weight_decay"] = wd
+        # Revert all weight + optimizer-state mutation from the probe steps.
+        _restore_from_probe(optimizer, probe_snapshot)
 
     out: List[ParamVsAdamw] = []
-    for p, g, ar, lr in metas:
+    for p, g, ar, lr, pname in metas:
         key = id(p)
         if key not in g_acc or key not in a_acc:
             continue
@@ -537,7 +588,7 @@ def calibrate_vs_adamw(
         sqrt_max = (ar["match_rms_adamw"] / 0.2) if ar["match_rms_adamw"] else None
         out.append(
             ParamVsAdamw(
-                name=g.get("name", "?"),
+                name=pname,
                 is_muon=_is_muon_group(g),
                 rows=p.shape[0] if p.ndim >= 1 else 1,
                 cols=p.shape[1] if p.ndim >= 2 else 1,
