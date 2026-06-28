@@ -30,7 +30,6 @@ import itertools
 import math
 import statistics
 from collections import defaultdict
-from typing import List
 
 import torch
 
@@ -155,8 +154,10 @@ def _summ(xs):
 
 def run_one(path, device, dtype, steps, warmup, seq, reference):
     print(f"\n{'='*82}\nMODEL: {path}   (reference={reference})\n{'='*82}")
+    dev = torch.device(device)
     tok, model = load_model(path, device, dtype)
-    print(f"  loaded {model.__class__.__name__} on {torch.cuda.get_device_name(device)}")
+    device_label = torch.cuda.get_device_name(dev) if dev.type == "cuda" else str(dev)
+    print(f"  loaded {model.__class__.__name__} on {device_label}")
     muon, backup = split_params_for_muon(model)
     print(f"  muon matrices: {len(muon)}   backup params: {len(backup)}")
     opt = GefenMuonHybrid(
@@ -211,7 +212,8 @@ def run_one(path, device, dtype, steps, warmup, seq, reference):
         print("\n  " + cal.summary())
 
     del opt, model
-    torch.cuda.empty_cache()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
     return result
 
 
