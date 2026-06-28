@@ -20,6 +20,9 @@ from gefen.kernels.automatic_gefen_fused import (
 from gefen.kernels.automatic_gefen_fused import (
     automatic_gefen_fused_update_v2_full_cuda as _automatic_gefen_fused_update_v2_full_cuda,
 )
+from gefen.kernels.automatic_gefen_fused import (
+    gefen_quantized_momentum_update_cuda as _gefen_quantized_momentum_update_cuda,
+)
 from gefen.kernels.automatic_gefen_fused import _should_use_v2
 
 FIND_PERIOD_BACKEND = None
@@ -926,6 +929,34 @@ class Gefen(torch.optim.Optimizer):
             beta1=beta1,
             lr=lr,
         )
+
+    def _gefen_quantized_momentum_update(
+        self, state, grad_view, beta1
+    ) -> torch.Tensor:
+        # Muon-specific quantized-momentum update. Advances the quantized momentum
+        # state (m_codebook / m_magnitude) by one EMA step and returns the DENSE
+        # quantized momentum for Newton-Schulz in a single kernel pass -- no lr==0
+        # dummy-stepsize parameter write, and no second full-size codebook gather.
+        codebook = self._gefen_codebook
+        if codebook is None:
+            raise ValueError(
+                "Expected Gefen codebook to be initialized before quantized momentum update."
+            )
+        # Allocate contiguous explicitly (not empty_like, which would inherit a
+        # non-contiguous memory format and trip the kernel's contiguity guard);
+        # the kernel wrapper also forces grad_view contiguous.
+        momentum_out = torch.empty(
+            grad_view.shape, dtype=grad_view.dtype, device=grad_view.device
+        )
+        _gefen_quantized_momentum_update_cuda(
+            grad_view,
+            state["m_codebook"],
+            state["m_magnitude"],
+            codebook,
+            momentum_out,
+            beta1,
+        )
+        return momentum_out
 
     def _automatic_gefen_fused_full_update(
         self,

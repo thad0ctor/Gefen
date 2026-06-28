@@ -25,6 +25,7 @@
 | Peak memory during the step | large transient spikes | much lower peak — room for bigger models / batches |
 | Sharded multi-GPU training (FSDP2) | breaks with the fast path | works — for plain Gefen *and* Muon |
 | Whole-model Muon | 2D weight matrices only | `GefenMuonHybrid` trains the entire model |
+| Muon step efficiency | generic momentum hack + redundant dequant gather | single-pass momentum kernel (bit-exact) + direct FSDP shard-slice |
 | Save / resume checkpoints | can corrupt state or lose tuning on resume | saves &amp; resumes correctly |
 | Crash safety | missing device / edge-case guards | guarded against wrong-device, empty-tensor, and race bugs |
 | Tested correctness | no fused-kernel tests | bit-exact + distributed parity test suite |
@@ -257,15 +258,17 @@ optimizer = GefenMuonHybrid(
 
 **Moun Learning rate — set `adjust_lr_fn="match_rms_adamw"`.** The Hybrid feeds a > *single* `lr` to both halves, but Muon (2D matrices) and AdamW/Gefen (everything > else) want different LR scales, so the shared `lr` is only meaningful after a per-parameter rescale:
 
- - **`adjust_lr_fn="match_rms_adamw"`** (recommended) rescales the Muon update to
+ - **`adjust_lr_fn="match_rms_adamw"`** (recommended, and the **`GefenMuonHybrid`
+   default**) rescales the Muon update to
    AdamW-equivalent RMS (`0.2·√max(rows, cols)`). Then **one AdamW-scale `lr` is
    correct for both halves**, and the [Learning rate](#learning-rate-when-porting-an-adamw-config)
    guidance above (Gefen wants ~0.6× AdamW's on Qwen3) applies to the whole model.
- - **`adjust_lr_fn=None`** (the *default*, = "original" Muon scaling
-   `√max(1, rows/cols)`) leaves the Muon half on its native scale. Passing an
-   AdamW-sized `lr` here **under-trains the 2D Muon matrices** — and because both
-   halves share one `lr`, there's no single value that suits Muon-native *and*
-   the Gefen backup. **Don't use the default with an AdamW-scale `lr`.**
+ - **`adjust_lr_fn=None`** (= "original" Muon scaling `√max(1, rows/cols)`; this
+   is the bare `GefenMuon` default, **not** the Hybrid's) leaves the Muon half on
+   its native scale. Passing an AdamW-sized `lr` here **under-trains the 2D Muon
+   matrices** — and because both halves share one `lr`, there's no single value
+   that suits Muon-native *and* the Gefen backup. **Don't pair `None` with an
+   AdamW-scale `lr`.**
 
 It supports `step()`, `zero_grad()`, `state_dict()`/`load_state_dict()`, and LR schedulers (e.g. `torch.optim.lr_scheduler.StepLR(optimizer, ...)`) like any optimizer. Because its constructor takes two parameter lists rather than a single iterable, build it yourself and hand it to the Hugging Face `Trainer` via `optimizers=` (not `optimizer_cls_and_kwargs`):
 
@@ -316,6 +319,30 @@ optim_args:
 **Not (yet) exposed via axolotl config:** the **Muon hybrid** (`GefenMuonHybrid` + `adjust_lr_fn`) is **not** in PR #3755 (the PR notes Muon is "more involved") — use it directly in Python per [Gefen-Muon](#extension-gefen-muon) above. `MEMORY_SAFE_FALLBACK` is a module default (on in this fork), toggled in code rather than YAML.
 
 > PR #3755 is an early draft and marked *untested* upstream; the config keys above may change — check the PR for the current state.
+
+## Experimental: approximate sharded Newton-Schulz (`sharded_mode`)
+
+> ⚠️ Opt-in, **non-parity** — default is `sharded_mode="exact"`.
+
+Under FSDP2 each rank holds a row-shard of every 2D weight, but Newton-Schulz orthogonalizes the **whole** matrix. The default (`"exact"`) all-gathers the full gradient per matrix and runs NS on it — bit-for-bit single-GPU parity. `"approx"` skips the gather and runs NS on each rank's **local shard only**: faster and lighter, but not parity — and the loss penalty **grows with shard count**.
+
+```python
+from gefen import GefenMuonHybrid
+
+opt = GefenMuonHybrid(
+    muon_named_params, backup_named_params,
+    lr=5e-5, adjust_lr_fn="match_rms_adamw", fused=True,
+    sharded_mode="approx",   # default "exact" (parity); "approx" = faster, non-parity
+)
+# only takes effect under FSDP2 (DTensor params); no-op single-GPU
+```
+
+Qwen3-0.6B, FSDP2, Alpaca, 2000 steps, lr `5e-5` (data replicated so the only variable is the NS approximation):
+
+![Gefen-Muon exact vs approx sharded — eval loss](docs/benchmarks/muon_shard_loss.png)
+![Gefen-Muon exact vs approx sharded — step time & VRAM](docs/benchmarks/muon_shard_perf.png)
+
+`approx` runs ~**1.3× faster**/step for **+0.033** eval loss at 2 shards and **+0.067** at 4 — the gap roughly doubles 2→4 shards, so treat it as an opt-in speed lever, not a default. For exact numerics without the per-step gather, instead **replicate** the Muon matrices under FSDP (a wrapping choice, not a flag).
 
 ## Citation:
 
