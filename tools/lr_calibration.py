@@ -108,8 +108,24 @@ def _rms(t: torch.Tensor) -> float:
 # otherwise advance the model's weights and the optimizer's state (step counters,
 # 8-bit momentum codebooks, vmean, the learned codebook, the global step). To keep
 # the documented "safe to run against a live training job" contract, we snapshot
-# the params (to CPU, to bound GPU memory) and a deep copy of the optimizer's
-# state_dict before the probe and restore both in a ``finally``.
+# BOTH the params and the optimizer state to CPU before the probe and restore them
+# in a ``finally`` -- keeping everything off-GPU so the probe never doubles VRAM.
+def _clone_state_to_cpu(value):
+    """Deep-copy an optimizer state_dict to CPU: every tensor is detached and
+    copied to host memory, containers are rebuilt recursively, and non-tensor
+    leaves are deep-copied. This avoids ``copy.deepcopy`` cloning GPU tensors on
+    the GPU (which would spike VRAM on a large live optimizer)."""
+    if torch.is_tensor(value):
+        return value.detach().to("cpu", copy=True)
+    if isinstance(value, dict):
+        return {k: _clone_state_to_cpu(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clone_state_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_state_to_cpu(v) for v in value)
+    return copy.deepcopy(value)
+
+
 def _snapshot_for_probe(optimizer):
     seen = set()
     param_backup = []
@@ -119,9 +135,10 @@ def _snapshot_for_probe(optimizer):
                 continue
             seen.add(id(p))
             param_backup.append((p, _local(p).detach().to("cpu", copy=True)))
-    # deepcopy because Optimizer.state_dict() returns references to the live state
-    # tensors, not copies -- without this the "snapshot" would track the mutation.
-    opt_state = copy.deepcopy(optimizer.state_dict())
+    # CPU clone (not copy.deepcopy): Optimizer.state_dict() returns references to
+    # the live state tensors, so we must copy to snapshot -- and copy to CPU so the
+    # snapshot doesn't double GPU memory. load_state_dict re-devices on restore.
+    opt_state = _clone_state_to_cpu(optimizer.state_dict())
     return param_backup, opt_state
 
 
