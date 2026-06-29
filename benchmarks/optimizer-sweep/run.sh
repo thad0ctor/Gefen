@@ -35,6 +35,10 @@ EVAL_EVERY=50
 LR_SWEEP=0
 SWEEP_STEPS=175
 MUON_ADJUST="match_rms_adamw"
+# gefen_muon recommended config (the published table/plots use these): split LR
+# (backup_lr = fraction x the cell LR) + per-element 2nd moment on 1D params.
+MUON_BACKUP_LR_FRACTION="0.5"
+MUON_BACKUP_1D=1
 OPTS_DEFAULT="adamw_bf16 adamw8bit adamw4bit gefen_fused gefen_muon"
 OPTS="$OPTS_DEFAULT"
 NO_MUON=0
@@ -114,6 +118,8 @@ Options:
   --no-muon              Drop gefen_muon from the run (it is in the default set but is
                          the slowest optimizer; use this to skip the Newton-Schulz cost).
   --muon-adjust MODE     gefen_muon adjust_lr_fn (default $MUON_ADJUST).
+  --muon-backup-lr-frac F  gefen_muon backup_lr as a fraction of the cell LR (default $MUON_BACKUP_LR_FRACTION).
+  --no-muon-backup-1d    disable gefen_muon backup_1d_period_one (default: on).
   --eval-every N         Intermediate eval-logging cadence (default $EVAL_EVERY).
   --lr-sweep             Run a short per-optimizer LR sweep first and use each
                          optimizer's best LR for the finals (default: documented fair LRs).
@@ -151,6 +157,8 @@ while [ $# -gt 0 ]; do
     --opts)        OPTS="$2"; CLI_SET[opts]=1; shift 2 ;;
     --no-muon)     NO_MUON=1; CLI_SET[no_muon]=1; shift ;;
     --muon-adjust) MUON_ADJUST="$2"; CLI_SET[muon_adjust]=1; shift 2 ;;
+    --muon-backup-lr-frac) MUON_BACKUP_LR_FRACTION="$2"; CLI_SET[muon_backup_lr_fraction]=1; shift 2 ;;
+    --no-muon-backup-1d) MUON_BACKUP_1D=0; CLI_SET[muon_backup_1d]=1; shift ;;
     --eval-every)  EVAL_EVERY="$2"; CLI_SET[eval_every]=1; shift 2 ;;
     --lr-sweep)    LR_SWEEP=1; CLI_SET[lr_sweep]=1; shift ;;
     --sweep-steps) SWEEP_STEPS="$2"; CLI_SET[sweep_steps]=1; shift 2 ;;
@@ -191,6 +199,8 @@ if [ -n "$CONFIG" ]; then
       dataset)     set_if_unset dataset DATASET "$v1" ;;
       opts)        set_if_unset opts OPTS "$v1" ;;
       muon_adjust) set_if_unset muon_adjust MUON_ADJUST "$v1" ;;
+      muon_backup_lr_fraction) set_if_unset muon_backup_lr_fraction MUON_BACKUP_LR_FRACTION "$v1" ;;
+      muon_backup_1d) [ -n "${CLI_SET[muon_backup_1d]:-}" ] || { [ "$v1" = "false" ] && MUON_BACKUP_1D=0 || MUON_BACKUP_1D=1; } ;;
       eval_every)  set_if_unset eval_every EVAL_EVERY "$v1" ;;
       sweep_steps) set_if_unset sweep_steps SWEEP_STEPS "$v1" ;;
       no_muon)     [ -n "${CLI_SET[no_muon]:-}" ] || { [ "$v1" = "true" ] && NO_MUON=1 || NO_MUON=0; } ;;
@@ -280,11 +290,19 @@ next_gpu() { # echoes a free gpu id, blocking until one frees
 
 run_cell() { # gpu tag model opt lr steps out logfile
   local gpu="$1" tag="$2" model="$3" opt="$4" lr="$5" steps="$6" out="$7" log="$8"
+  # gefen_muon: apply the recommended config (split backup LR + 1D period-one).
+  local muon_flags=()
+  if [ "$opt" = "gefen_muon" ]; then
+    local blr
+    blr=$(awk -v l="$lr" -v f="$MUON_BACKUP_LR_FRACTION" 'BEGIN{printf "%g", l*f}')
+    muon_flags+=(--backup-lr "$blr" --variant recommended)
+    [ "$MUON_BACKUP_1D" = "1" ] && muon_flags+=(--backup-1d-period-one)
+  fi
   echo "[start $(date +%T)] $tag $opt lr=$lr gpu=$gpu steps=$steps -> $log"
   "$PY" "$CELL" --opt "$opt" --model "$model" --lr "$lr" --seed "$SEED" \
     --steps "$steps" --seq "$SEQ" --gpu "$gpu" --arch "$ARCH" --tag "$tag" \
     --dataset "$DATASET" --eval-every "$EVAL_EVERY" --muon-adjust "$MUON_ADJUST" \
-    --out "$out" > "$log" 2>&1
+    "${muon_flags[@]}" --out "$out" > "$log" 2>&1
   local rc=$?
   echo "[done  $(date +%T)] $tag $opt rc=$rc"
   [ "$rc" -ne 0 ] && echo "$tag $opt lr=$lr gpu=$gpu rc=$rc (see $log)" >> "$FAILLOG"

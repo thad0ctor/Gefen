@@ -130,6 +130,8 @@ Optimizer comparison on a full fine-tune, **with each optimizer at its own fair 
 
 > Measured on the Muon/Gefen performance commits unique to this fork — with Gefen-Muon at its recommended hybrid config — as of `16d66af`
 
+You can run these yourself — see [`benchmarks/`](benchmarks/README.md) for what each suite measures and how to reproduce the tables/plots (`bash benchmarks/optimizer-sweep/run.sh` regenerates this comparison, with the recommended Gefen-Muon config applied by default).
+
 **Testing environment**
 - **Hardware:** NVIDIA RTX 3090 (Ampere, sm_86), single GPU per run.
 - **Software:** PyTorch 2.12.0 (cu133), Python 3.12; Gefen fused CUDA kernels JIT-built for sm_86.
