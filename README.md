@@ -329,7 +329,7 @@ opt = GefenMuonHybrid(
 )
 ```
 
-Below (RTX 5090, Qwen3-0.6B, 400 steps). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; `fp8` speeds the NS kernel but its `torch.compile`/quant overhead can slow the full step on small models (the win shows on larger ones). No lever hurts loss — all track default Muon (AdamW shown for reference).
+Below (RTX 5090, Qwen3-0.6B, 400 steps). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; `fp8` speeds the NS kernel but its `torch.compile`/quant overhead means it only pays off once matrices are large enough — measured end-to-end it's **0.89×** at 0.6B but **1.21×** at Qwen3-4B (949 → 1151 tok/s, same VRAM). No lever hurts loss — all track default Muon (AdamW shown for reference).
 
 ![Gefen-Muon faster Newton-Schulz — real-training loss (AdamW + variants)](docs/benchmarks/muon_ns_loss.png)
 ![Gefen-Muon faster Newton-Schulz — end-to-end throughput (tok/s)](docs/benchmarks/muon_ns_throughput.png)
