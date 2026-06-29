@@ -57,10 +57,13 @@ _FP8_MIN_SCALE = 1e-12
 # fp8 tensor-core GEMMs (the e4m3 path used here) need sm_89+ (Ada / Hopper /
 # Blackwell). Older GPUs (e.g. Ampere sm_80/86) have no fp8 GEMM.
 _FP8_MIN_CAPABILITY = (8, 9)
-# fp8 only beats bf16 on LARGE matrices -- the per-row quant overhead dominates on
-# small/skinny ones (measured: 512x2048 loses, >=2048 min-dim wins on sm_120). So
-# even on a supported GPU, fp8 is used only when the matrix's smaller dim >= this.
-FP8_MIN_DIM = 1024
+# fp8 only beats bf16 once the matrix is large enough for the fp8 tensor-core GEMM
+# to outrun cuBLAS bf16; below that the fp8 path is a net loss. Measured square
+# crossover on sm_120 (RTX 5090, NS call, torch.compile-fused): min-dim 1024->0.77x,
+# 1280->0.77x, 1536->1.23x, 2048->1.31x. So even on a supported GPU, fp8 is used
+# only when the matrix's smaller dim >= this. 1024 admitted the losing Qwen3-0.6B
+# shapes (all min-dim 1024, 0.84-0.93x); 1536 is the measured break-even.
+FP8_MIN_DIM = 1536
 _ns_fp8_compiled = None
 _fp8_fallback_warned = False
 

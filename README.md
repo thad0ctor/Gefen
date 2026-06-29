@@ -32,7 +32,7 @@
 | Getting started | no Axolotl / fork-install guidance | Axolotl how-to + fair loss/speed/memory benchmarks |
 | Muon-vs-AdamW eval-loss gap | no Muon-specific LR handling — Muon trails AdamW | split `muon_lr`/`backup_lr` (~0.5×) + `backup_1d_period_one` + `match_rms_adamw` default recover most of the gap → best Gefen variant (Qwen3-0.6B 1.501→1.459, 1.7B 1.326→1.271) |
 | Newton-Schulz iteration cost | fixed classic 5-step quintic only | tunable `ns_schedule` — `tuned4` (~1.25×) / `tuned3` (~1.6×); default `standard` is bit-identical to the quintic |
-| Low-precision orthogonalization | bf16 Newton-Schulz only | opt-in `fp8_ns` (e4m3), arch+size-gated (sm_89+, min-dim ≥ 1024) with bit-identical bf16 fallback — ~1.26–1.35× on large matrices |
+| Low-precision orthogonalization | bf16 Newton-Schulz only | opt-in `fp8_ns` (e4m3), arch+size-gated (sm_89+, min-dim ≥ 1536) with bit-identical bf16 fallback — ~1.26–1.35× on large matrices |
 | Sharded Muon orthogonalization (FSDP2) | every rank redundantly runs full NS | `sharded_mode="distributed"` round-robins matrix ownership (exact NS + broadcast) — parity with `exact` (±0.001), scales with ranks (1.06×@2, 1.12×@4 GPUs) |
 
 Measured numbers (Qwen3 0.6B / 1.7B) and the technical details are in [Benchmarks](#benchmarks) and the sections below.
@@ -318,7 +318,7 @@ optim_args:
 Newton-Schulz orthogonalization is ~90% of a Muon step and is GEMM-FLOP-bound, so it has two independent per-rank speed levers that stack with `sharded_mode` below:
 
 - **`ns_schedule`** — tuned per-iteration NS coefficients instead of one fixed quintic. `"tuned4"` matches the standard 5-step orthogonality in **4 iterations** (~**1.2×** faster NS); `"tuned3"` is more aggressive (3 iterations, ~**1.6×**) at some orthogonality cost on square/wide shapes.
-- **`fp8_ns`** — run the NS matmuls in fp8 (e4m3) with a bf16 master. **Arch+size-gated**: it engages only on sm_89+ (Ada/Blackwell) and matrices with min-dim ≥ 1024, and otherwise falls back bit-identically to bf16 with a one-time warning — so `fp8_ns=True` is a portable config, not a hard error. ~**1.3×** on the NS kernel for large matrices; orthogonality stays within ~11% of bf16 (non-parity, self-correcting). Needs `torch.compile` (on by default via `fp8_ns_compile`).
+- **`fp8_ns`** — run the NS matmuls in fp8 (e4m3) with a bf16 master. **Arch+size-gated**: it engages only on sm_89+ (Ada/Blackwell) and matrices with min-dim ≥ 1536 (the measured fp8-vs-bf16 GEMM break-even on sm_120), and otherwise falls back bit-identically to bf16 with a one-time warning — so `fp8_ns=True` is a portable config, not a hard error. ~**1.3×** on the NS kernel for large matrices; orthogonality stays within ~11% of bf16 (non-parity, self-correcting). Needs `torch.compile` (on by default via `fp8_ns_compile`).
 
 ```python
 opt = GefenMuonHybrid(
@@ -329,7 +329,7 @@ opt = GefenMuonHybrid(
 )
 ```
 
-Below (RTX 5090, Qwen3-0.6B, 400 steps). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; `fp8` speeds the NS kernel but its `torch.compile`/quant overhead means it only pays off once matrices are large enough — measured end-to-end it's **0.89×** at 0.6B but **1.21×** at Qwen3-4B (949 → 1151 tok/s, same VRAM). No lever hurts loss — all track default Muon (AdamW shown for reference).
+Below (RTX 5090, Qwen3-0.6B, 400 steps; the chart force-engages `fp8` to isolate it). **`tuned4` is the safe win** (faster, equal quality); `tuned3` is fastest but loosens orthogonality; **`fp8` only wins once the matrices are large enough for the fp8 GEMM to beat cuBLAS bf16** (measured crossover ~min-dim 1536) — forced on it's **0.89×** end-to-end at 0.6B (all matmuls min-dim 1024) but **1.21×** at Qwen3-4B (949 → 1151 tok/s, same VRAM). The default size gate (`FP8_MIN_DIM=1536`) falls back to bf16 below the crossover, so in practice you keep the large-model win without the small-model penalty. No lever hurts loss — all track default Muon (AdamW shown for reference).
 
 ![Gefen-Muon faster Newton-Schulz — real-training loss (AdamW + variants)](docs/benchmarks/muon_ns_loss.png)
 ![Gefen-Muon faster Newton-Schulz — end-to-end throughput (tok/s)](docs/benchmarks/muon_ns_throughput.png)
