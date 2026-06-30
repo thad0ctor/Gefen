@@ -271,7 +271,11 @@ elif args.opt == "gefen_muon":
     if args.ns_schedule is not None:
         _hybrid_kwargs["ns_schedule"] = args.ns_schedule
     opt = GefenMuonHybrid(*_split(m), **_hybrid_kwargs)
-    _eff_ns = args.ns_schedule if args.ns_schedule is not None else "tuned3 (default)"
+    # Record the EFFECTIVE schedule (the GefenMuonHybrid default when the flag is
+    # omitted) so the result artifact is unambiguous and reproducible even if the
+    # default changes; keep an explicit-vs-default marker alongside it.
+    _resolved_ns = args.ns_schedule if args.ns_schedule is not None else "tuned3"
+    _eff_ns = _resolved_ns if args.ns_schedule is not None else f"{_resolved_ns} (default)"
     print(f"[gefen_muon] adjust_lr_fn={_adj!r} muon_lr={args.muon_lr} "
           f"backup_lr={args.backup_lr} backup_1d_period_one={args.backup_1d_period_one} "
           f"backup_2d_period_one={args.backup_2d_period_one} ns_schedule={_eff_ns} "
@@ -366,7 +370,8 @@ res = {
             "muon_lr": args.muon_lr, "backup_lr": args.backup_lr,
             "backup_1d_period_one": args.backup_1d_period_one,
             "backup_2d_period_one": args.backup_2d_period_one,
-            "ns_schedule": args.ns_schedule,
+            "ns_schedule": _resolved_ns,
+            "ns_schedule_explicit": args.ns_schedule is not None,
             "stochastic_round": args.stochastic_round,
             "no_decay_substrings": args.no_decay_substrings,
         }

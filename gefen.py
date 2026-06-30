@@ -1,5 +1,6 @@
 import math
 import os
+import warnings
 from itertools import chain
 from typing import Iterable, Optional, Tuple, Union
 
@@ -564,7 +565,20 @@ class Gefen(torch.optim.Optimizer):
         # This cancels the systematic bias that nearest-rounding the EMA momentum
         # accumulates over a long horizon. Default False is bit-identical to the
         # prior behavior (the kernels take the same parity-preserving fast path).
+        # Only the fused CUDA automatic-step kernels honor this flag; the
+        # non-fused / CPU quantizers use deterministic nearest rounding. Warn (do
+        # not hard-error -- mirroring fp8_ns's portable-config behavior) so
+        # stochastic_round=True is not a silent no-op when the fused path is off
+        # (fused=False, CUDA unavailable, or the fused-step global disabled).
         self._stochastic_round = stochastic_round
+        if stochastic_round and not self._use_fused_gefen_automatic_step():
+            warnings.warn(
+                "stochastic_round=True is honored only by the fused Gefen "
+                "automatic-step CUDA kernels; the non-fused / CPU path uses "
+                "deterministic nearest rounding, so the flag is a no-op here.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.verbose = verbose
 
         self._printed_optimizer_memory = False
