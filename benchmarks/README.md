@@ -19,7 +19,9 @@ Outputs land in the configured out-dir: per-cell logs, `results.jsonl`, `compari
 
 ## Reproducing the published Gefen-Muon numbers
 
-`run.sh` applies the **recommended Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, `backup_lr = 0.5 × the cell LR`, and `backup_1d_period_one` — which is what the published table/plots use. Override via config keys (`muon_adjust`, `muon_backup_lr_fraction`, `muon_backup_1d`) or flags (`--muon-adjust`, `--muon-backup-lr-frac`, `--no-muon-backup-1d`). See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
+`run.sh` applies the **recommended Gefen-Muon config by default** — `adjust_lr_fn=match_rms_adamw`, `backup_lr = 0.5 × the cell LR`, and `backup_1d_period_one`. Override via config keys (`muon_adjust`, `muon_backup_lr_fraction`, `muon_backup_1d`) or flags (`--muon-adjust`, `--muon-backup-lr-frac`, `--no-muon-backup-1d`). See [the optimizer-sweep README](optimizer-sweep/README.md) for the full flag list.
+
+> **Note on the published `gefen_muon` throughput:** it reflects the current `GefenMuonHybrid` default `ns_schedule="tuned3"` (loss-neutral, ~1.4× the classic quintic — measured +38%/+39% on the 3090-class GPUs used). `run.sh` reproduces it (tuned3 is the default); pass `--ns-schedule standard` to `sweep_cell` for the bit-identical classic quintic (~0.7× the throughput, same loss). The other optimizers' rows are schedule-independent.
 
 ## microbench scripts
 
